@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "usyd-pg-import"
+version = "0.1.0"
+description = "Import USYD postgraduate Excel data into PostgreSQL."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "psycopg[binary]>=3.2,<4.0",
+  "streamlit>=1.44,<2.0",
+  "pandas>=2.2,<3.0",
+  "pydantic>=2.8,<3.0",
+  "Scrapy>=2.11,<3.0",
+  "playwright>=1.52,<2.0",
+  "scrapy-playwright>=0.0.41,<1.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+include = ["src*"]
