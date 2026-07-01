@@ -1,2 +1,1 @@
-"""DTOs for import pipeline."""
-
+"""Shared DTOs and Pydantic models."""

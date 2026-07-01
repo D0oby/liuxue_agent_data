@@ -7,6 +7,8 @@ import streamlit as st
 
 from src.config import load_settings
 from src.db import connect
+from src.models.recommendation import RangePreference, RecommendationRequest, RecommendationResponse
+from src.recommendation.service import RecommendationService, RecommendationServiceError
 
 
 INTAKE_ORDER = ["JAN", "FEB", "MAR", "JUL", "AUG", "OCT"]
@@ -211,7 +213,7 @@ def enrich_courses_df(courses_df: pd.DataFrame) -> pd.DataFrame:
 def apply_filters(courses_df: pd.DataFrame, intakes_df: pd.DataFrame) -> pd.DataFrame:
     st.sidebar.header("筛选条件")
 
-    keyword = st.sidebar.text_input("关键词", placeholder="课程名 / CRICOS")
+    keyword = st.sidebar.text_input("关键词", placeholder="课程名 / CRICOS / 录取要求")
     selected_intakes = st.sidebar.multiselect("开学季", INTAKE_ORDER)
     only_crawled = st.sidebar.checkbox("只看已补官网招生信息", value=True)
     selected_application_filters = st.sidebar.multiselect("申请特征", list(APPLICATION_FILTERS.keys()))
@@ -249,11 +251,7 @@ def apply_filters(courses_df: pd.DataFrame, intakes_df: pd.DataFrame) -> pd.Data
         display_df = display_df[display_df["id"].isin(matched_course_ids)]
 
     if keyword.strip():
-        normalized_keyword = keyword.strip().lower()
-        display_df = display_df[
-            display_df["course_name"].str.lower().str.contains(normalized_keyword, na=False)
-            | display_df["cricos"].str.lower().str.contains(normalized_keyword, na=False)
-        ]
+        display_df = display_df[_build_keyword_mask(display_df, keyword)]
 
     if only_crawled:
         display_df = display_df[display_df["has_crawled_admissions"]]
@@ -295,6 +293,29 @@ def apply_filters(courses_df: pd.DataFrame, intakes_df: pd.DataFrame) -> pd.Data
     sort_column, ascending = SORT_OPTIONS[sort_label]
     display_df = display_df.sort_values(sort_column, ascending=ascending, na_position="last")
     return display_df
+
+
+def _build_keyword_mask(display_df: pd.DataFrame, keyword: str) -> pd.Series:
+    normalized_keyword = keyword.strip().lower()
+    searchable_columns = [
+        "course_name",
+        "cricos",
+        "academic_requirement_text",
+        "raw_english_requirement",
+        "academic_summary",
+        "application_flags_display",
+        "required_documents_display",
+        "language_tests_display",
+    ]
+    mask = pd.Series(False, index=display_df.index)
+    for column in searchable_columns:
+        if column not in display_df:
+            continue
+        mask = mask | display_df[column].fillna("").astype(str).str.lower().str.contains(
+            normalized_keyword,
+            regex=False,
+        )
+    return mask
 
 
 def render_summary(display_df: pd.DataFrame) -> None:
@@ -388,6 +409,458 @@ def render_source_details(row: pd.Series) -> None:
     st.dataframe(pd.DataFrame(source_rows), width="stretch", hide_index=True)
 
 
+def run_admission_semantic_search(query: str, top_k: int) -> list[Any]:
+    from src.vector_store.embeddings import OpenAIEmbeddingClient
+    from src.vector_store.runner import search_admissions
+    from src.vector_store.storage import ChromaVectorStore
+
+    settings = load_settings()
+    if not settings.openai_api_key:
+        raise RuntimeError("OPENAI_API_KEY 未配置，暂时不能使用语义搜索。")
+    vector_store = ChromaVectorStore.from_settings(settings)
+
+    embedding_client = OpenAIEmbeddingClient(
+        api_key=settings.openai_api_key,
+        model=settings.embedding_model,
+        dimensions=settings.embedding_dimensions,
+        base_url=settings.openai_base_url,
+        api_mode=settings.embedding_api_mode,
+        max_workers=settings.embedding_max_workers,
+    )
+    return search_admissions(
+        vector_store=vector_store,
+        embedding_client=embedding_client,
+        embedding_model=settings.embedding_model,
+        query=query,
+        top_k=top_k,
+    )
+
+
+def render_admission_search() -> None:
+    with st.form("admission_semantic_search", border=False):
+        search_query = st.text_input(
+            "录取要求语义搜索",
+            placeholder="作品集 / personal statement / IELTS 7.0 / work experience",
+        )
+        control_left, control_right = st.columns([1, 4])
+        with control_left:
+            top_k = st.number_input("结果数", min_value=3, max_value=20, value=5, step=1)
+        with control_right:
+            submitted = st.form_submit_button("搜索", type="primary", use_container_width=True)
+
+    if not submitted:
+        return
+
+    normalized_query = search_query.strip()
+    if not normalized_query:
+        st.warning("请输入搜索内容。")
+        return
+
+    try:
+        with st.spinner("正在搜索录取要求..."):
+            results = run_admission_semantic_search(normalized_query, int(top_k))
+    except RuntimeError as exc:
+        st.warning(str(exc))
+        return
+    except Exception as exc:  # pragma: no cover - Streamlit-facing safety net
+        st.error(f"搜索失败：{exc}")
+        return
+
+    if not results:
+        st.info("没有找到匹配的录取要求。")
+        return
+
+    result_rows = [
+        {
+            "课程": result.course_name,
+            "CRICOS": result.cricos,
+            "类型": _format_chunk_kind(result.chunk_kind),
+            "匹配度": f"{result.similarity:.3f}",
+            "摘要": _trim_text(result.content, limit=260),
+            "来源": result.source_url or "",
+        }
+        for result in results
+    ]
+    st.dataframe(pd.DataFrame(result_rows), width="stretch", hide_index=True)
+
+
+def _format_chunk_kind(chunk_kind: str) -> str:
+    labels = {
+        "academic": "学术要求",
+        "english": "语言要求",
+        "application": "申请材料",
+    }
+    return labels.get(chunk_kind, chunk_kind)
+
+
+def run_usyd_recommendation(request: RecommendationRequest) -> RecommendationResponse:
+    return RecommendationService().recommend(request)
+
+
+def render_recommendation_console() -> None:
+    st.subheader("申请资格筛选 / Hard Filter")
+
+    with st.form("usyd_recommendation_form", border=True):
+        st.caption("国内院校成绩按悉尼大学口径使用所有科目的算术平均分。")
+        top_left, top_right = st.columns([2, 1])
+        with top_left:
+            target_major_keyword = st.text_input("目标方向", value="计算机")
+        with top_right:
+            academic_background = st.selectbox("本科院校层级", ["双非", "211", "985", "C9", "Tier1", "其他国内院校"], index=0)
+
+        academic_left, academic_right = st.columns([1, 2])
+        with academic_left:
+            gpa_user = st.number_input("GPA / WAM", min_value=0.0, max_value=100.0, value=82.0, step=0.5)
+        with academic_right:
+            prior_major = st.text_input("本科专业", value="Computer Science")
+
+        completed_courses_text = st.text_area(
+            "已修课程",
+            value="Programming\nStatistics\nDatabase Systems",
+            help="每行一门课，也可以用逗号分隔。",
+        )
+
+        score_left, score_mid, score_right = st.columns(3)
+        with score_left:
+            ielts_overall_user = st.number_input("IELTS 总分", min_value=0.0, max_value=9.0, value=7.0, step=0.5)
+        with score_mid:
+            ielts_min_band_user = st.number_input("IELTS 最低小分", min_value=0.0, max_value=9.0, value=6.5, step=0.5)
+        with score_right:
+            accepts_pathway = st.checkbox("接受 pathway", value=False)
+
+        band_left, band_mid_left, band_mid_right, band_right = st.columns(4)
+        with band_left:
+            ielts_listening_user = st.number_input("IELTS 听力", min_value=0.0, max_value=9.0, value=6.5, step=0.5)
+        with band_mid_left:
+            ielts_reading_user = st.number_input("IELTS 阅读", min_value=0.0, max_value=9.0, value=6.5, step=0.5)
+        with band_mid_right:
+            ielts_speaking_user = st.number_input("IELTS 口语", min_value=0.0, max_value=9.0, value=6.5, step=0.5)
+        with band_right:
+            ielts_writing_user = st.number_input("IELTS 写作", min_value=0.0, max_value=9.0, value=6.5, step=0.5)
+
+        pref_left, pref_mid, pref_right = st.columns(3)
+        with pref_left:
+            preferred_intake = st.multiselect("偏好开学季", INTAKE_ORDER, default=["FEB", "JUL"])
+        with pref_mid:
+            budget_range = st.slider("预算区间 AUD", min_value=0, max_value=120000, value=(0, 70000), step=1000)
+        with pref_right:
+            duration_preference = st.slider("学制偏好 年", min_value=0.5, max_value=4.0, value=(1.0, 2.0), step=0.5)
+
+        extra_left, extra_mid, extra_right = st.columns(3)
+        with extra_left:
+            campus_preference = st.text_input("校区偏好", placeholder="Camperdown / Sydney / Online")
+        with extra_mid:
+            study_mode_preference = st.selectbox("学习模式偏好", ["", "On campus", "Online", "Full time", "Part time"], index=0)
+        with extra_right:
+            degree_type_preference = st.selectbox("学位类型偏好", ["", "Master", "Graduate Diploma", "Graduate Certificate"], index=0)
+
+        submitted = st.form_submit_button("运行申请资格筛选", type="primary", use_container_width=True)
+
+    if submitted:
+        request = RecommendationRequest(
+            target_major_keyword=target_major_keyword,
+            gpa_user=float(gpa_user),
+            gpa_scale=100,
+            ielts_overall_user=float(ielts_overall_user),
+            ielts_min_band_user=float(ielts_min_band_user),
+            ielts_listening_user=float(ielts_listening_user),
+            ielts_reading_user=float(ielts_reading_user),
+            ielts_speaking_user=float(ielts_speaking_user),
+            ielts_writing_user=float(ielts_writing_user),
+            academic_background=academic_background,
+            prior_major=prior_major or None,
+            completed_courses=_split_course_text(completed_courses_text),
+            preferred_intake=preferred_intake or INTAKE_ORDER,
+            budget_range=RangePreference(min=float(budget_range[0]), max=float(budget_range[1])),
+            duration_preference=RangePreference(
+                min=float(duration_preference[0]),
+                max=float(duration_preference[1]),
+            ),
+            campus_preference=campus_preference or None,
+            study_mode_preference=study_mode_preference or None,
+            degree_type_preference=degree_type_preference or None,
+            accepts_pathway=accepts_pathway,
+        )
+        try:
+            with st.spinner("正在运行 hard filter 并生成下一层匹配..."):
+                st.session_state["usyd_recommendation_response"] = run_usyd_recommendation(request)
+        except RecommendationServiceError as exc:
+            st.error(f"推荐失败：{exc}")
+            return
+        except Exception as exc:  # pragma: no cover - Streamlit-facing safety net
+            st.error(f"推荐失败：{exc}")
+            return
+
+    response = st.session_state.get("usyd_recommendation_response")
+    if response is None:
+        st.info("填写用户画像后运行申请资格筛选。")
+        return
+
+    render_recommendation_response(response)
+
+
+def _split_course_text(value: str) -> list[str]:
+    courses: list[str] = []
+    seen: set[str] = set()
+    for chunk in value.replace(",", "\n").splitlines():
+        label = " ".join(chunk.split()).strip()
+        key = label.casefold()
+        if label and key not in seen:
+            seen.add(key)
+            courses.append(label)
+    return courses
+
+
+def render_recommendation_response(response: RecommendationResponse) -> None:
+    metadata = response.metadata
+    summary = response.eligibility_summary
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("总候选数", summary.total_candidates)
+    metric_cols[1].metric("满足硬性要求", summary.eligible_count)
+    metric_cols[2].metric("高风险", summary.high_risk_count)
+    metric_cols[3].metric("Pathway required", summary.pathway_required_count)
+    metric_cols[4].metric("信息不足", summary.unknown_count)
+    metric_cols[5].metric("不满足", summary.ineligible_count)
+
+    st.caption(
+        f"request_id: {metadata.request_id} | "
+        f"model: {metadata.model_version} | "
+        f"generated_at: {metadata.generated_at.isoformat()} | "
+        f"scored_after_hard_filter: {metadata.scored_candidate_count} | "
+        f"retrieval_degraded: {'yes' if metadata.degraded_retrieval else 'no'}"
+    )
+
+    hard_tabs = st.tabs(["满足硬性要求，进入下一层匹配", "高风险 / pathway / 信息不足", "不满足硬性要求"])
+    with hard_tabs[0]:
+        render_next_layer_candidates(response)
+    with hard_tabs[1]:
+        render_high_risk_programs(response)
+    with hard_tabs[2]:
+        render_excluded_programs(response)
+
+    with st.expander("查询摘要与评分配置", expanded=False):
+        render_query_summary(response)
+
+
+def render_next_layer_candidates(response: RecommendationResponse) -> None:
+    if not response.next_layer_candidates:
+        st.info("当前没有课程通过硬性申请条件。")
+        return
+
+    st.markdown("**下一层匹配分档**")
+    band_tabs = st.tabs(["冲刺", "匹配", "保底"])
+    with band_tabs[0]:
+        render_recommendation_band(response.reach_programs)
+    with band_tabs[1]:
+        render_recommendation_band(response.match_programs)
+    with band_tabs[2]:
+        render_recommendation_band(response.safety_programs)
+
+    st.divider()
+    for program in response.next_layer_candidates:
+        render_eligibility_card(program, expanded=False)
+
+
+def render_high_risk_programs(response: RecommendationResponse) -> None:
+    if not response.high_risk_programs:
+        st.success("当前没有高风险、pathway required 或信息不足课程。")
+        return
+
+    for program in response.high_risk_programs:
+        render_eligibility_card(program, expanded=False)
+
+
+def render_eligibility_card(program: Any, *, expanded: bool) -> None:
+    badge = _eligibility_badge(program.eligibility_status)
+    title = f"{program.course_name} | {badge}"
+    with st.expander(title, expanded=expanded):
+        top_cols = st.columns(4)
+        top_cols[0].markdown(f"**Course**  \n{program.course_name}")
+        top_cols[1].markdown(f"**Faculty / School**  \n{program.faculty or '-'} / {program.school or '-'}")
+        top_cols[2].markdown(f"**Degree**  \n{program.degree_type or '-'}")
+        top_cols[3].markdown(f"**Tuition**  \n{_format_money(program.tuition_fee_aud)}")
+
+        meta_cols = st.columns(4)
+        meta_cols[0].markdown(f"**Duration**  \n{program.duration or '-'}")
+        meta_cols[1].markdown(f"**Campus**  \n{program.campus or '-'}")
+        meta_cols[2].markdown(f"**Study mode**  \n{program.study_mode or '-'}")
+        meta_cols[3].markdown(f"**Intake**  \n{', '.join(program.intakes) or '-'}")
+
+        if program.source_url:
+            st.markdown(f"[打开官网来源]({program.source_url})")
+
+        st.markdown(f"**Hard filter summary**  \n{program.hard_filter_summary}")
+        if program.blocking_reasons:
+            st.error("Blocking reasons: " + " | ".join(program.blocking_reasons))
+        if program.warnings:
+            st.warning("Warnings: " + " | ".join(program.warnings))
+        if program.missing_fields:
+            st.info("需要人工复核字段: " + ", ".join(program.missing_fields))
+
+        checklist_df = build_requirement_checks_dataframe(program.requirement_checks)
+        st.dataframe(checklist_df, width="stretch", hide_index=True)
+        render_check_evidence(program.requirement_checks)
+
+
+def build_requirement_checks_dataframe(checks: list[Any]) -> pd.DataFrame:
+    rows = []
+    for check in checks:
+        item = check.model_dump() if hasattr(check, "model_dump") else dict(check)
+        rows.append(
+            {
+                "条件": item.get("name", ""),
+                "用户情况": _display_cell_value(item.get("user_value")),
+                "学校要求": _display_cell_value(item.get("required_value")),
+                "判断": item.get("status", ""),
+                "原因": item.get("reason", ""),
+            }
+        )
+    return pd.DataFrame(rows, columns=["条件", "用户情况", "学校要求", "判断", "原因"])
+
+
+def render_check_evidence(checks: list[Any]) -> None:
+    for check in checks:
+        item = check.model_dump() if hasattr(check, "model_dump") else dict(check)
+        if item.get("status") not in {"fail", "warning", "unknown"}:
+            continue
+        snippets = item.get("evidence_snippets") or []
+        if not snippets and not item.get("source_url"):
+            continue
+        with st.expander(f"Evidence | {item.get('name', '')} | {item.get('status', '')}", expanded=False):
+            evidence_rows = []
+            for snippet in snippets:
+                if hasattr(snippet, "model_dump"):
+                    snippet_data = snippet.model_dump()
+                else:
+                    snippet_data = dict(snippet)
+                evidence_rows.append(
+                    {
+                        "evidence snippet": snippet_data.get("text", ""),
+                        "source_url": snippet_data.get("source_url") or item.get("source_url") or "",
+                        "source type": snippet_data.get("source") or item.get("source_type") or "",
+                    }
+                )
+            if not evidence_rows:
+                evidence_rows.append(
+                    {
+                        "evidence snippet": "",
+                        "source_url": item.get("source_url") or "",
+                        "source type": item.get("source_type") or "",
+                    }
+                )
+            st.dataframe(pd.DataFrame(evidence_rows), width="stretch", hide_index=True)
+
+
+def _display_cell_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return f"{value:g}"
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value)
+    if isinstance(value, dict):
+        return ", ".join(f"{key}: {val}" for key, val in value.items())
+    return str(value)
+
+
+def _eligibility_badge(status: Any) -> str:
+    status_value = getattr(status, "value", str(status))
+    labels = {
+        "ELIGIBLE": "满足硬性要求",
+        "HIGH_RISK": "高风险",
+        "PATHWAY_REQUIRED": "Pathway required",
+        "UNKNOWN": "信息不足",
+        "INELIGIBLE": "不满足硬性要求",
+    }
+    return labels.get(status_value, status_value)
+
+
+def _format_money(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"AUD {value:,.0f}"
+
+
+def render_recommendation_band(programs: list[Any]) -> None:
+    if not programs:
+        st.info("当前没有该档推荐。")
+        return
+
+    rows = [
+        {
+            "课程": program.course_name,
+            "CRICOS": program.cricos,
+            "分数": f"{program.score:.4f}",
+            "档位": program.band,
+            "学制": program.duration,
+            "开学季": ", ".join(program.intakes),
+            "学费(AUD)": program.tuition_fee_aud,
+            "IELTS": program.ielts_requirement,
+            "GPA算法": _format_gpa_method(program.gpa_calculation_method),
+            "来源": program.source_url or "",
+        }
+        for program in programs
+    ]
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    for program in programs:
+        with st.expander(f"{program.course_name} | {program.band} | score {program.score:.4f}", expanded=False):
+            st.write(program.recommendation_reason)
+            st.markdown("**学术要求摘要**")
+            st.write(program.academic_requirement_summary)
+            evidence_rows = [
+                {
+                    "证据": snippet.text,
+                    "来源类型": snippet.source or "",
+                    "来源 URL": snippet.source_url or "",
+                }
+                for snippet in program.evidence_snippets
+            ]
+            if evidence_rows:
+                st.dataframe(pd.DataFrame(evidence_rows), width="stretch", hide_index=True)
+
+
+def render_excluded_programs(response: RecommendationResponse) -> None:
+    if not response.excluded_programs:
+        st.success("当前没有不满足硬性要求的课程。")
+        return
+
+    rows = [
+        {
+            "课程": program.course_name,
+            "资格状态": _eligibility_badge(program.eligibility_status),
+            "Blocking reasons": " | ".join(program.blocking_reasons) or program.reason,
+            "说明": program.hard_filter_summary,
+            "来源": program.source_url or "",
+        }
+        for program in response.excluded_programs
+    ]
+    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    for program in response.excluded_programs:
+        render_eligibility_card(program, expanded=False)
+
+
+def render_query_summary(response: RecommendationResponse) -> None:
+    query_summary = response.query_summary
+    summary_rows = [
+        {"字段": key, "值": value}
+        for key, value in query_summary.items()
+        if key not in {"degraded_retrieval"}
+    ]
+    st.dataframe(pd.DataFrame(summary_rows), width="stretch", hide_index=True)
+
+    with st.expander("评分配置", expanded=False):
+        st.json(response.metadata.scoring_config)
+
+
+def _format_gpa_method(method: str) -> str:
+    labels = {
+        "usyd_arithmetic_average_all_courses": "悉尼大学：所有科目的算术平均分",
+    }
+    return labels.get(method, method)
+
+
 def render_course_detail(display_df: pd.DataFrame) -> None:
     st.divider()
     st.subheader("课程详情")
@@ -415,7 +888,7 @@ def render_course_detail(display_df: pd.DataFrame) -> None:
     with header_right:
         st.markdown(
             f"""
-            <div style="background:#f7f5ef;border:1px solid #d8d1c3;padding:0.85rem 1rem;border-radius:12px;">
+            <div style="background:#f7f5ef;border:1px solid #d8d1c3;padding:0.85rem 1rem;border-radius:8px;">
                 <div style="font-size:0.9rem;color:#6c6558;">招生信息来源</div>
                 <div style="font-size:1.1rem;font-weight:600;color:#2d2a26;">{row["admission_source_label"]}</div>
                 <div style="margin-top:0.35rem;font-size:0.9rem;color:#6c6558;">最近验证: {row["last_verified_at"] or "-"}</div>
@@ -439,24 +912,37 @@ def render_course_detail(display_df: pd.DataFrame) -> None:
 
 
 def render_dashboard() -> None:
-    st.set_page_config(page_title="USYD Query Console", layout="wide")
+    st.set_page_config(page_title="USYD Recommendation Console", layout="wide")
     st.markdown(
         """
         <style>
         .block-container {padding-top: 1.2rem; padding-bottom: 1.2rem; max-width: 1500px;}
         div[data-testid="stMetric"] {
-            background: linear-gradient(180deg, #faf7f0 0%, #f2ede1 100%);
+            background: #f7f5ef;
             border: 1px solid #d8d1c3;
             padding: 0.9rem 1rem;
-            border-radius: 12px;
+            border-radius: 8px;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
-    st.title("USYD 课程查询后台")
-    st.caption("现在会同时展示 Excel 基础字段和官网新爬回来的 academic requirements、language tests、application details。")
+    st.title("USYD 留学方案工作台")
+    st.caption("推荐方案使用只读 RAG + Agent 链路；课程查询保留 Excel 与官网招生信息后台。")
+
+    mode = st.radio(
+        "工作区",
+        ["推荐方案", "课程查询"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    if mode == "推荐方案":
+        render_recommendation_console()
+        return
+
+    render_admission_search()
 
     courses_df, intakes_df = fetch_dashboard_data()
     intake_map = build_intake_map(intakes_df)

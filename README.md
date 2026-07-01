@@ -12,6 +12,8 @@
 - `IELTS Academic` 拆到 `course_admission_requirements`
 - IELTS 小分拆成听力 / 阅读 / 口语 / 写作四列
 - 官网爬虫会补全 `academic requirements`、`language tests`、`application details`
+- 爬虫长文本可切块、生成 embedding，并写入本地 ChromaDB 向量库
+- 只读 USYD RAG + Agent MVP 推荐层，可输出 reach / match / safety / excluded 方案
 - 本地 Streamlit 页面可直接展示官网招生信息详情和来源链接
 - 全流程在单个事务内执行
 - 提供本地 Streamlit 查询后台
@@ -49,6 +51,8 @@ usyd_pg_import/
   给 `course_admission_requirements` 增加 IELTS 四项小分列，并把旧 `english_req_details` 数据回填进去。
 - `004_admissions_crawl_schema.sql`
   为官网爬虫新增 JSONB 结构化字段、来源 fingerprint 和 `course_admission_dlq` 表。
+- `005_admission_vector_chunks.sql`
+  历史 pgvector 迁移，当前向量索引默认改为 ChromaDB 本地持久化 collection。
 
 ### `src/`
 
@@ -60,6 +64,31 @@ usyd_pg_import/
   管理 PostgreSQL 连接、事务和 SQL migration 执行。
 - `src/dashboard.py`
   Streamlit 查询后台页面，负责筛选、导出和展示官网招生信息详情。
+- `src/api.py`
+  FastAPI 推荐 API 入口，提供 `POST /recommendations/usyd`。
+- `src/recommendation/`
+  只读推荐决策层，包含 Repository、RAG 检索、要求标准化、评分、分档、计划组装和单体 PlanningAgent。
+
+### `src/recommendation/`
+
+- `src/recommendation/service.py`
+  推荐层服务入口，负责加载配置、创建数据库连接、组装默认 `PlanningAgent`，并把推荐流程结果包装成 `RecommendationResponse`。
+- `src/recommendation/agent.py`
+  单体 `PlanningAgent` 和固定工具封装，只负责按顺序编排用户画像解析、候选召回、要求标准化、评分和方案生成。
+- `src/recommendation/profile.py`
+  把 `RecommendationRequest` 解析成内部 `UserProfile`，并标准化 `preferred_intake`，例如 `S1`、`Feb`、`Semester 2`。
+- `src/recommendation/query_builder.py`
+  根据目标方向生成关键词查询和语义查询，当前内置计算机、数据分析、商科等方向映射。
+- `src/recommendation/retrieval.py`
+  Hybrid RAG 召回逻辑，包含关键词检索、向量检索、候选合并、证据片段保留和向量不可用时的降级标记。
+- `src/recommendation/repository.py`
+  推荐层只读 Repository，负责读取 `courses`、`course_intakes` 和 `course_admission_requirements`，并映射为检索/要求对象；语义召回由 ChromaDB collection 提供。
+- `src/recommendation/requirements.py`
+  招生要求标准化服务，负责从当前录取要求中解析 IELTS，并按悉尼大学国内院校口径生成可计算 GPA 阈值。
+- `src/recommendation/scoring.py`
+  GPA/IELTS 配置化评分和 `REACH`、`MATCH`、`SAFETY` 分档逻辑，同时把无法评分课程转入排除列表。
+- `src/recommendation/plan.py`
+  推荐方案组装器，按分档、检索相关度、预算、学制、intake 和 IELTS 小分硬门槛生成最终项目列表与排除原因。
 
 ### `src/extract/`
 
@@ -81,6 +110,8 @@ usyd_pg_import/
 
 - `src/models/dto.py`
   导入链路用的数据对象定义，比如课程记录、admission requirement、intake 等 DTO。
+- `src/models/recommendation.py`
+  推荐链路用的 Pydantic schema，定义请求、用户画像、检索命中、候选课程、标准化要求、评分结果、推荐项目、排除项目和最终响应。
 
 ### `src/load/`
 
@@ -191,10 +222,26 @@ usyd_pg_import/
 - `raw_payload_json`
 - `retryable`
 
+### ChromaDB collection: `course_admission_chunks`
+
+存 RAG / 语义检索用的招生文本块和 embedding，默认持久化到 `var/chroma`。每条 record 的 document 是 chunk 正文，embedding 由外部 embedding client 生成，metadata 用来保留课程和招生来源信息。
+
+关键 metadata：
+
+- `course_id`
+- `requirement_id`
+- `chunk_kind`：`academic` / `english` / `application`
+- `content_hash`
+- `course_name`
+- `cricos`
+- `source_url`
+- `embedding_model`
+- `embedded_at`
+
 ## 安装
 
 ```bash
-cd /Users/admin/Documents/liuxue_agent\ data/usyd_pg_import
+cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -206,6 +253,7 @@ pip install -e .
 
 ```bash
 export DATABASE_URL='postgresql://admin@127.0.0.1:5432/usyd_courses'
+export OPENAI_API_KEY='sk-...'
 ```
 
 当前这台机器已经在使用这个连接串：
@@ -214,26 +262,40 @@ export DATABASE_URL='postgresql://admin@127.0.0.1:5432/usyd_courses'
 postgresql://admin@127.0.0.1:5432/usyd_courses
 ```
 
+推荐层配置默认值如下，可在 `.env` 或环境变量中覆盖：
+
+```bash
+RECOMMENDATION_SCORING_GPA_WEIGHT=0.7
+RECOMMENDATION_SCORING_IELTS_WEIGHT=0.3
+RECOMMENDATION_BAND_REACH_UPPER=0.95
+RECOMMENDATION_BAND_MATCH_UPPER=1.1
+RECOMMENDATION_RETRIEVAL_KEYWORD_TOP_K=30
+RECOMMENDATION_RETRIEVAL_VECTOR_TOP_K=30
+RECOMMENDATION_RETRIEVAL_FINAL_CANDIDATE_LIMIT=50
+RECOMMENDATION_OUTPUT_MAX_PROGRAMS_PER_BAND=5
+RECOMMENDATION_RULES_ENABLE_IELTS_BAND_GATE=true
+```
+
 ## 执行迁移
 
 ```bash
-cd /Users/admin/Documents/liuxue_agent\ data/usyd_pg_import
+cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
 PYTHONPATH=. python3 -m src.cli migrate
 ```
 
 ## 导入 Excel
 
 ```bash
-cd /Users/admin/Documents/liuxue_agent\ data/usyd_pg_import
+cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
 PYTHONPATH=. python3 -m src.cli import-excel \
-  --file '/Users/admin/Documents/liuxue_agent data/USYD_Postgraduate_Courses_Perfect_纠正版.xlsx'
+  --file '/Users/admin/Documents/liuxue_agent real/data/usyd_postgraduate_courses_corrected.xlsx'
 ```
 
 首次导入时可以一起跑迁移：
 
 ```bash
 PYTHONPATH=. python3 -m src.cli import-excel \
-  --file '/Users/admin/Documents/liuxue_agent data/USYD_Postgraduate_Courses_Perfect_纠正版.xlsx' \
+  --file '/Users/admin/Documents/liuxue_agent real/data/usyd_postgraduate_courses_corrected.xlsx' \
   --migrate-first
 ```
 
@@ -242,7 +304,7 @@ PYTHONPATH=. python3 -m src.cli import-excel \
 安装完依赖后可以直接启动本地查询后台：
 
 ```bash
-cd /Users/admin/Documents/liuxue_agent\ data/usyd_pg_import
+cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
 source .venv/bin/activate
 streamlit run src/dashboard.py
 ```
@@ -250,7 +312,7 @@ streamlit run src/dashboard.py
 如果你要跑官网招生信息爬虫，还需要安装 Playwright 浏览器：
 
 ```bash
-cd /Users/admin/Documents/liuxue_agent\ data/usyd_pg_import
+cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
 source .venv/bin/activate
 pip install -e .
 playwright install chromium
@@ -265,6 +327,8 @@ http://localhost:8501
 当前页面风格更接近查询后台，而不是仪表盘。你可以直接做这些操作：
 
 - 按课程名或 `CRICOS` 搜索
+- 在首页搜索框按自然语言检索向量化后的录取要求
+- 侧边栏关键词可同时搜索课程名、`CRICOS`、学术要求、语言要求和申请材料
 - 按开学季筛选
 - 只看已经补齐官网招生信息的课程
 - 按 `Limited places`、`Portfolio`、`References`、`Personal statement` 等申请特征筛选
@@ -328,9 +392,60 @@ order by duration_max_years desc, course_name;
 当前测试只依赖标准库：
 
 ```bash
-cd /Users/admin/Documents/liuxue_agent\ data/usyd_pg_import
+cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
 PYTHONPATH=. python3 -m unittest discover -s tests -v
 ```
+
+## 提交到 GitHub
+
+这个项目已经配置成通过 `SSH` 推送到 GitHub，远程仓库是：
+
+```text
+git@github.com:D0oby/liuxue_agent_data.git
+```
+
+### 日常提交
+
+如果只是提交当前项目里的改动，直接运行：
+
+```bash
+cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
+./scripts/git_quick_push.sh "你的提交说明"
+```
+
+这个脚本会自动执行：
+
+- `git add .`
+- `git commit -m "..."`
+- `git push`
+
+### 手动提交
+
+如果你想自己分步执行：
+
+```bash
+cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
+git status -sb
+git add .
+git commit -m "你的提交说明"
+git push
+```
+
+### 首次 SSH 配置说明
+
+当前这台机器已经完成以下配置：
+
+- 生成 GitHub SSH key
+- 在 `~/.ssh/config` 中指定 GitHub 使用专用 key
+- 仓库 `origin` 已切换到 SSH remote
+- Git 默认分支已设为 `main`
+
+如果以后换新电脑，核心步骤就是：
+
+1. 生成 SSH key
+2. 把公钥加到 GitHub SSH keys
+3. 把仓库 remote 设成 `git@github.com:D0oby/liuxue_agent_data.git`
+4. 验证 `ssh -T git@github.com`
 
 ## 爬取官网招生信息并补全 SQL
 
@@ -357,7 +472,7 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 基础用法：
 
 ```bash
-cd /Users/admin/Documents/liuxue_agent\ data/usyd_pg_import
+cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
 source .venv/bin/activate
 PYTHONPATH=. python3 -m src.cli crawl-admissions --limit 20
 ```
@@ -375,3 +490,153 @@ PYTHONPATH=. python3 -m src.cli crawl-admissions --limit 20
 - 如果没有 URL，会优先匹配悉尼大学课程 sitemap，再回退官网搜索结果。
 - 课程页抓不到明确语言分数时，会回退到悉尼大学中央英语要求页补齐标准要求。
 - 当前实现会把官网结构化结果写入多个 JSONB 字段，并在查询后台直接展示。
+
+## 转成向量数据库
+
+向量库使用 ChromaDB 本地持久化格式，默认写入 `var/chroma` 下的 `course_admission_chunks` collection。PostgreSQL 继续保存课程、intake 和招生要求等结构化数据，不再依赖 pgvector 扩展做语义召回。
+
+可用环境变量：
+
+- `CHROMA_PERSIST_DIRECTORY`：ChromaDB 本地持久化目录，默认 `var/chroma`
+- `CHROMA_COLLECTION_NAME`：招生 chunk collection 名，默认 `course_admission_chunks`
+
+先确认依赖和数据库迁移已就绪：
+
+```bash
+cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
+source .venv/bin/activate
+pip install -e .
+PYTHONPATH=. python3 -m src.cli migrate
+```
+
+先做一次 dry run，确认会处理多少课程和文本块：
+
+```bash
+PYTHONPATH=. python3 -m src.cli vectorize-admissions --dry-run
+```
+
+正式生成 embedding 并写入 ChromaDB collection：
+
+```bash
+export OPENAI_API_KEY='sk-...'
+PYTHONPATH=. python3 -m src.cli vectorize-admissions
+```
+
+常用参数：
+
+- `--limit 20`：先只向量化少量课程做测试
+- `--source all`：不只处理爬虫数据，也处理 Excel seed 数据
+- `--force`：即使已有相同文本块也重新生成 embedding
+- `--max-chars 1200` / `--overlap-chars 160`：控制长文本切块大小和重叠
+
+语义搜索验证：
+
+```bash
+PYTHONPATH=. python3 -m src.cli search-admissions "哪些课程需要作品集或个人陈述？" --top-k 5
+```
+
+## USYD RAG + Agent 推荐 API
+
+推荐层只读现有 PostgreSQL 数据表：`courses`、`course_intakes`、`course_admission_requirements`；语义 evidence 从 ChromaDB `course_admission_chunks` collection 召回。它不会重建 Excel 导入或官网爬虫，也不会按 `CRICOS` 去重；候选课程合并主键是 `course_id`。
+
+国内院校 GPA/均分按 `/Users/admin/Documents/澳大利亚八大硕士入学要求-2026.pdf` 中悉尼大学口径处理：使用所有科目的算术平均分。当前规则覆盖：
+
+- 工程与计算机学院常见课程：`C9/Tier1/985/211 = 75%`，`双非/其他国内院校 = 80%`。
+- 商学院核心课程（Commerce / Professional Accounting）：`C9/Tier1 = 65%`，`985/211 = 75%`，`双非/其他国内院校 = 87%`。
+- 其他未细分课程默认沿用 `C9/Tier1/985/211 = 75%`，`双非/其他国内院校 = 80%`，并在推荐解释中保留“悉尼大学：所有科目的算术平均分”口径。
+
+启动 API：
+
+```bash
+cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
+source .venv/bin/activate
+pip install -e .
+PYTHONPATH=. uvicorn src.api:app --reload --port 8000
+```
+
+如果 `OPENAI_API_KEY` 或 ChromaDB collection 不可用，系统会降级为关键词检索，并在响应 `metadata.degraded_retrieval` 标记为 `true`。
+
+请求示例：
+
+```bash
+curl -X POST http://127.0.0.1:8000/recommendations/usyd \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target_major_keyword": "计算机",
+    "gpa_user": 82,
+    "ielts_overall_user": 7.0,
+    "ielts_min_band_user": 6.5,
+    "academic_background": "双非",
+    "preferred_intake": ["FEB", "JUL"],
+    "budget_range": {"min": 0, "max": 70000},
+    "duration_preference": {"min": 1, "max": 2}
+  }'
+```
+
+响应结构示例：
+
+```json
+{
+  "user_profile": {
+    "target_major_keyword": "计算机",
+    "gpa_user": 82,
+    "ielts_overall_user": 7.0,
+    "ielts_min_band_user": 6.5,
+    "academic_background": "双非",
+    "preferred_intake": ["FEB", "JUL"],
+    "budget_range": {"min": 0, "max": 70000},
+    "duration_preference": {"min": 1, "max": 2}
+  },
+  "query_summary": {
+    "keyword_query": "computer science OR information technology OR computing OR software engineering OR artificial intelligence OR data systems",
+    "semantic_query": "Master programs related to computer science, IT, software engineering, AI and data systems",
+    "candidate_count": 12,
+    "degraded_retrieval": false
+  },
+  "reach_programs": [],
+  "match_programs": [
+    {
+      "course_id": "uuid",
+      "course_name": "Master of Computer Science",
+      "cricos": "123456A",
+      "duration": "1.5 years",
+      "intakes": ["FEB", "JUL"],
+      "tuition_fee_aud": 56000,
+      "ielts_requirement": "IELTS 6.5 overall, minimum band 6",
+      "academic_requirement_summary": "Admission requires a bachelor's degree...",
+      "score": 1.0412,
+      "band": "MATCH",
+      "recommendation_reason": "GPA, IELTS, relevance, evidence and source explanation.",
+      "evidence_snippets": [{"text": "Admission evidence...", "source_url": "https://www.sydney.edu.au/...", "source": "academic"}],
+      "source_url": "https://www.sydney.edu.au/..."
+    }
+  ],
+  "safety_programs": [],
+  "excluded_programs": [
+    {
+      "course_id": "uuid",
+      "course_name": "Course with missing data",
+      "reason": "missing_requirement",
+      "details": "Current admission requirement is missing for this course.",
+      "source_url": null,
+      "evidence_snippets": []
+    }
+  ],
+  "metadata": {
+    "request_id": "uuid",
+    "model_version": "usyd-rag-agent-mvp-v1",
+    "candidate_count": 12,
+    "scored_candidate_count": 8,
+    "degraded_retrieval": false,
+    "scoring_config": {}
+  },
+  "explanation": "Generated reach, match and safety recommendations with explicit exclusions."
+}
+```
+
+测试推荐层和现有链路：
+
+```bash
+cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
+PYTHONPATH=. .venv/bin/python -m unittest discover -s tests -v
+```
