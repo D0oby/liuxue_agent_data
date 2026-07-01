@@ -4,10 +4,11 @@ Issues and PRDs for this repo live as GitHub issues in `D0oby/liuxue_agent_data`
 Use the `gh` CLI for all operations.
 
 When commands run from this directory, `gh` can infer the repo from
-`git remote -v`. The remote is:
+`git remote -v`. Use the HTTPS remote because SSH pushes may be blocked in
+managed execution environments:
 
 ```text
-git@github.com:D0oby/liuxue_agent_data.git
+https://github.com/D0oby/liuxue_agent_data.git
 ```
 
 ## Conventions
