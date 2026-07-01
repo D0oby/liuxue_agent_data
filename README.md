@@ -14,6 +14,7 @@
 - 官网爬虫会补全 `academic requirements`、`language tests`、`application details`
 - 爬虫长文本可切块、生成 embedding，并写入本地 ChromaDB 向量库
 - 只读 USYD RAG + Agent MVP 推荐层，可输出 reach / match / safety / excluded 方案
+- 课程画像特征层支持 JSONB 存储、规则生成、人工覆盖、用户画像匹配、Dashboard 展示/编辑和审计
 - 本地 Streamlit 页面可直接展示官网招生信息详情和来源链接
 - 全流程在单个事务内执行
 - 提供本地 Streamlit 查询后台
@@ -53,6 +54,9 @@ usyd_pg_import/
   为官网爬虫新增 JSONB 结构化字段、来源 fingerprint 和 `course_admission_dlq` 表。
 - `005_admission_vector_chunks.sql`
   历史 pgvector 迁移，当前向量索引默认改为 ChromaDB 本地持久化 collection。
+- `006_course_features.sql`
+- `007_course_feature_overrides.sql`
+  在 `courses` 表上新增可空 `course_feature_overrides` JSONB 字段，用于保存人工覆盖。
 
 ### `src/`
 
@@ -65,7 +69,7 @@ usyd_pg_import/
 - `src/dashboard.py`
   Streamlit 查询后台页面，负责筛选、导出和展示官网招生信息详情。
 - `src/api.py`
-  FastAPI 推荐 API 入口，提供 `POST /recommendations/usyd`。
+  FastAPI 推荐 API 入口，提供推荐、课程画像读取/生成/编辑、画像匹配和画像筛选接口。
 - `src/recommendation/`
   只读推荐决策层，包含 Repository、RAG 检索、要求标准化、评分、分档、计划组装和单体 PlanningAgent。
 
@@ -89,6 +93,10 @@ usyd_pg_import/
   GPA/IELTS 配置化评分和 `REACH`、`MATCH`、`SAFETY` 分档逻辑，同时把无法评分课程转入排除列表。
 - `src/recommendation/plan.py`
   推荐方案组装器，按分档、检索相关度、预算、学制、intake 和 IELTS 小分硬门槛生成最终项目列表与排除原因。
+- `src/recommendation/course_features.py`
+  课程画像规则生成、人工覆盖合并、画像匹配、画像筛选和审计逻辑。
+- `src/recommendation/feature_repository.py`
+  课程画像读写、批量生成选择和审计数据读取。
 
 ### `src/extract/`
 
@@ -112,6 +120,10 @@ usyd_pg_import/
   导入链路用的数据对象定义，比如课程记录、admission requirement、intake 等 DTO。
 - `src/models/recommendation.py`
   推荐链路用的 Pydantic schema，定义请求、用户画像、检索命中、候选课程、标准化要求、评分结果、推荐项目、排除项目和最终响应。
+- `src/models/course_features.py`
+  课程画像、用户画像、匹配结果和审计结果 schema，标签字段安全默认为空数组，0-5 分字段有范围校验。
+- `src/models/feature_taxonomy.py`
+  集中管理规则生成使用的标签关键词映射。
 
 ### `src/load/`
 
@@ -221,6 +233,54 @@ usyd_pg_import/
 - `error_message`
 - `raw_payload_json`
 - `retryable`
+
+### `courses.course_features` / `courses.course_feature_overrides`
+
+课程画像特征的可空 JSONB 字段。`course_features` 保存当前有效画像，`course_feature_overrides` 保存人工覆盖字段。规则生成会保留人工覆盖，除非调用方明确替换。
+
+关键字段由 `CourseFeatureProfile` 约束：
+
+- `discipline_tags`
+- `knowledge_tags`
+- `career_tags`
+- `background_fit_tags`
+- `math_intensity`
+- `coding_intensity`
+- `theory_intensity`
+- `business_intensity`
+- `ai_relevance`
+- `data_relevance`
+- `conversion_friendliness`
+- `risk_level`
+
+## 课程画像特征
+
+批量生成缺失画像：
+
+```bash
+PYTHONPATH=. python -m src.cli generate-course-features
+```
+
+审计画像质量：
+
+```bash
+PYTHONPATH=. python -m src.cli audit-course-features
+```
+
+常用 API：
+
+- `GET /courses/{course_id}/features`
+- `POST /courses/{course_id}/generate-features`
+- `PATCH /courses/{course_id}/features`
+- `POST /courses/match`
+- `GET /courses/filter-features`
+
+上线顺序：
+
+1. 运行 migration。
+2. 运行 `generate-course-features --dry-run` 检查生成数量。
+3. 运行 `generate-course-features` 写入缺失画像。
+4. 运行 `audit-course-features` 检查缺失、空标签、全零分数和高风险 outlier。
 
 ### ChromaDB collection: `course_admission_chunks`
 

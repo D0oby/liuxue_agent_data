@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pandas as pd
@@ -7,7 +8,10 @@ import streamlit as st
 
 from src.config import load_settings
 from src.db import connect
+from src.models.course_features import CourseFeatureProfile
 from src.models.recommendation import RangePreference, RecommendationRequest, RecommendationResponse
+from src.recommendation.course_features import generate_course_features, merge_course_feature_override
+from src.recommendation.feature_repository import CourseFeatureRepository
 from src.recommendation.service import RecommendationService, RecommendationServiceError
 
 
@@ -67,7 +71,9 @@ def fetch_dashboard_data() -> tuple[pd.DataFrame, pd.DataFrame]:
                 car.ielts_reading,
                 car.ielts_speaking,
                 car.ielts_writing,
-                car.last_verified_at
+                car.last_verified_at,
+                c.course_features,
+                c.course_feature_overrides
             from courses c
             left join course_admission_requirements car
               on car.course_id = c.id
@@ -188,6 +194,8 @@ def enrich_courses_df(courses_df: pd.DataFrame) -> pd.DataFrame:
     enriched_df["application_details_json"] = enriched_df["application_details_json"].apply(_as_dict)
     enriched_df["supplementary_metadata_json"] = enriched_df["supplementary_metadata_json"].apply(_as_dict)
     enriched_df["source_map_json"] = enriched_df["source_map_json"].apply(_as_dict)
+    enriched_df["course_features"] = enriched_df["course_features"].apply(_as_dict)
+    enriched_df["course_feature_overrides"] = enriched_df["course_feature_overrides"].apply(_as_dict)
 
     enriched_df["has_crawled_admissions"] = enriched_df["requirement_source"].eq("usyd_web_crawl")
     enriched_df["admission_source_label"] = enriched_df["has_crawled_admissions"].map(
@@ -217,6 +225,11 @@ def apply_filters(courses_df: pd.DataFrame, intakes_df: pd.DataFrame) -> pd.Data
     selected_intakes = st.sidebar.multiselect("开学季", INTAKE_ORDER)
     only_crawled = st.sidebar.checkbox("只看已补官网招生信息", value=True)
     selected_application_filters = st.sidebar.multiselect("申请特征", list(APPLICATION_FILTERS.keys()))
+    selected_feature_tags = st.sidebar.multiselect(
+        "课程画像学科",
+        ["data science", "computer science", "business", "business analytics", "finance", "design", "health"],
+    )
+    min_ai_relevance = st.sidebar.slider("AI 相关度不少于", min_value=0, max_value=5, value=0, step=1)
 
     min_fee, max_fee = float(courses_df["tuition_fee_aud"].min()), float(courses_df["tuition_fee_aud"].max())
     fee_range = st.sidebar.slider("学费区间 (AUD)", min_value=min_fee, max_value=max_fee, value=(min_fee, max_fee))
@@ -258,6 +271,18 @@ def apply_filters(courses_df: pd.DataFrame, intakes_df: pd.DataFrame) -> pd.Data
 
     for label in selected_application_filters:
         display_df = display_df[display_df[APPLICATION_FILTERS[label]]]
+
+    if selected_feature_tags:
+        wanted_tags = set(selected_feature_tags)
+        display_df = display_df[
+            display_df["course_features"].apply(
+                lambda value: bool(wanted_tags & set(_feature_profile(value).discipline_tags))
+            )
+        ]
+    if min_ai_relevance:
+        display_df = display_df[
+            display_df["course_features"].apply(lambda value: _feature_profile(value).ai_relevance >= min_ai_relevance)
+        ]
 
     display_df = display_df[
         display_df["tuition_fee_aud"].between(fee_range[0], fee_range[1], inclusive="both")
@@ -797,6 +822,9 @@ def render_recommendation_band(programs: list[Any]) -> None:
             "学费(AUD)": program.tuition_fee_aud,
             "IELTS": program.ielts_requirement,
             "GPA算法": _format_gpa_method(program.gpa_calculation_method),
+            "画像匹配": (
+                f"{program.feature_match.score:.1f}" if getattr(program, "feature_match", None) is not None else ""
+            ),
             "来源": program.source_url or "",
         }
         for program in programs
@@ -806,6 +834,8 @@ def render_recommendation_band(programs: list[Any]) -> None:
     for program in programs:
         with st.expander(f"{program.course_name} | {program.band} | score {program.score:.4f}", expanded=False):
             st.write(program.recommendation_reason)
+            if getattr(program, "feature_match", None) is not None:
+                render_feature_match(program.feature_match)
             st.markdown("**学术要求摘要**")
             st.write(program.academic_requirement_summary)
             evidence_rows = [
@@ -897,7 +927,7 @@ def render_course_detail(display_df: pd.DataFrame) -> None:
             unsafe_allow_html=True,
         )
 
-    tab1, tab2, tab3, tab4 = st.tabs(["学术要求", "语言要求", "申请材料", "来源"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["学术要求", "语言要求", "申请材料", "来源", "画像特征"])
     with tab1:
         render_academic_pathways(row)
     with tab2:
@@ -909,6 +939,88 @@ def render_course_detail(display_df: pd.DataFrame) -> None:
         render_application_details(row)
     with tab4:
         render_source_details(row)
+    with tab5:
+        render_course_features(row)
+
+
+def render_feature_match(match_result: Any) -> None:
+    cols = st.columns(3)
+    cols[0].metric("画像匹配", f"{match_result.score:.1f}/100")
+    cols[1].metric("画像风险", f"{match_result.risk_level:.1f}/5")
+    cols[2].metric("硬性惩罚", f"{match_result.penalty_score:.1f}")
+    if match_result.strengths:
+        st.success("优势：" + " | ".join(match_result.strengths))
+    if match_result.weaknesses:
+        st.warning("弱项：" + " | ".join(match_result.weaknesses))
+
+
+def render_course_features(row: pd.Series) -> None:
+    profile = _feature_profile(row.get("course_features"))
+    tag_cols = st.columns(4)
+    tag_cols[0].markdown("**学科标签**  \n" + _format_tags(profile.discipline_tags))
+    tag_cols[1].markdown("**知识标签**  \n" + _format_tags(profile.knowledge_tags))
+    tag_cols[2].markdown("**职业方向**  \n" + _format_tags(profile.career_tags))
+    tag_cols[3].markdown("**适合背景**  \n" + _format_tags(profile.background_fit_tags))
+
+    score_rows = [
+        {"维度": "Math", "分数": profile.math_intensity},
+        {"维度": "Coding", "分数": profile.coding_intensity},
+        {"维度": "Theory", "分数": profile.theory_intensity},
+        {"维度": "Business", "分数": profile.business_intensity},
+        {"维度": "AI", "分数": profile.ai_relevance},
+        {"维度": "Data", "分数": profile.data_relevance},
+        {"维度": "Conversion", "分数": profile.conversion_friendliness},
+        {"维度": "Risk", "分数": profile.risk_level},
+    ]
+    st.dataframe(pd.DataFrame(score_rows), width="stretch", hide_index=True)
+
+    with st.expander("编辑画像特征", expanded=False):
+        render_course_feature_editor(row, profile)
+
+
+def render_course_feature_editor(row: pd.Series, profile: CourseFeatureProfile) -> None:
+    with st.form(f"feature_editor_{row['id']}", border=False):
+        tags_text = st.text_input("学科标签", value=", ".join(profile.discipline_tags))
+        ai_relevance = st.slider("AI 相关度", min_value=0, max_value=5, value=int(profile.ai_relevance), step=1)
+        data_relevance = st.slider("Data 相关度", min_value=0, max_value=5, value=int(profile.data_relevance), step=1)
+        risk_level = st.slider("风险等级", min_value=0, max_value=5, value=int(profile.risk_level), step=1)
+        submitted = st.form_submit_button("保存画像覆盖", use_container_width=True)
+    if not submitted:
+        return
+    overrides = {
+        "discipline_tags": _split_csv(tags_text),
+        "ai_relevance": float(ai_relevance),
+        "data_relevance": float(data_relevance),
+        "risk_level": float(risk_level),
+    }
+    try:
+        generated = generate_course_features(row.to_dict())
+        merged = merge_course_feature_override(generated, {**_as_dict(row.get("course_feature_overrides")), **overrides})
+        settings = load_settings()
+        with connect(settings) as conn:
+            with conn.transaction():
+                CourseFeatureRepository().save_course_features(
+                    conn,
+                    course_id=str(row["id"]),
+                    course_features=merged,
+                    manual_overrides={**_as_dict(row.get("course_feature_overrides")), **overrides},
+                )
+    except Exception as exc:  # pragma: no cover - Streamlit-facing safety net
+        st.error(f"画像特征保存失败：{exc}")
+        return
+    st.success("画像特征已保存。")
+
+
+def _feature_profile(value: Any) -> CourseFeatureProfile:
+    return CourseFeatureProfile.model_validate(_as_dict(value))
+
+
+def _format_tags(tags: list[str]) -> str:
+    return ", ".join(tags) if tags else "-"
+
+
+def _split_csv(value: str) -> list[str]:
+    return [chunk.strip() for chunk in value.split(",") if chunk.strip()]
 
 
 def render_dashboard() -> None:
@@ -944,7 +1056,11 @@ def render_dashboard() -> None:
 
     render_admission_search()
 
-    courses_df, intakes_df = fetch_dashboard_data()
+    try:
+        courses_df, intakes_df = fetch_dashboard_data()
+    except Exception as exc:  # pragma: no cover - Streamlit-facing safety net
+        st.error(f"课程数据加载失败：{exc}。如果刚更新课程画像功能，请先运行数据库 migration。")
+        return
     intake_map = build_intake_map(intakes_df)
     courses_df["intakes"] = courses_df["id"].map(intake_map).fillna("")
     courses_df["duration_display"] = build_duration_display(courses_df)

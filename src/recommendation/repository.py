@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from src.models.course_features import CourseFeatureProfile
 from src.models.recommendation import RawAdmissionRequirement
 
 
@@ -27,6 +28,7 @@ class CourseSearchRow:
     academic_requirements_json: dict[str, Any] | None = None
     application_details_json: dict[str, Any] | None = None
     supplementary_metadata_json: dict[str, Any] | None = None
+    course_features: CourseFeatureProfile | dict[str, Any] | None = None
 
 
 class RecommendationRepository:
@@ -79,7 +81,8 @@ class RecommendationRepository:
                     car.ielts_writing::float,
                     car.academic_requirements_json,
                     car.application_details_json,
-                    car.supplementary_metadata_json
+                    car.supplementary_metadata_json,
+                    c.course_features
                 from courses c
                 left join course_admission_requirements car
                   on car.course_id = c.id
@@ -118,7 +121,8 @@ class RecommendationRepository:
                     car.ielts_writing::float,
                     car.academic_requirements_json,
                     car.application_details_json,
-                    car.supplementary_metadata_json
+                    car.supplementary_metadata_json,
+                    c.course_features
                 from courses c
                 left join course_admission_requirements car
                   on car.course_id = c.id
@@ -226,6 +230,7 @@ class RecommendationRepository:
             academic_requirements_json=_as_dict(row[16]),
             application_details_json=_as_dict(row[17]),
             supplementary_metadata_json=_as_dict(row[18]),
+            course_features=_as_dict(row[19]) or None,
         )
 
 

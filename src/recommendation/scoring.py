@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import logging
 
 from src.config import RecommendationConfig
+from src.models.course_features import CourseFeatureProfile
 from src.models.recommendation import (
     CourseCandidate,
     ExcludedProgram,
@@ -13,6 +14,7 @@ from src.models.recommendation import (
     ScoreResult,
     UserProfile,
 )
+from src.recommendation.course_features import match_course_to_user, user_profile_to_features
 
 
 logger = logging.getLogger(__name__)
@@ -84,6 +86,7 @@ class ScoringService:
     ) -> ScoringOutcome:
         scored_candidates: list[ScoredCourseCandidate] = []
         excluded_programs: list[ExcludedProgram] = []
+        user_features = user_profile_to_features(user_profile)
 
         for candidate in candidates:
             requirement = requirements.get(candidate.course_id)
@@ -105,6 +108,7 @@ class ScoringService:
                 scored_candidates.append(
                     self._score_one(
                         user_profile=user_profile,
+                        user_features=user_features,
                         candidate=candidate,
                         requirement=requirement,
                     )
@@ -132,6 +136,7 @@ class ScoringService:
         self,
         *,
         user_profile: UserProfile,
+        user_features,
         candidate: CourseCandidate,
         requirement: NormalizedRequirement,
     ) -> ScoredCourseCandidate:
@@ -148,8 +153,16 @@ class ScoringService:
             match_band=match_band,
             reason_tags=self._reason_tags(user_profile, requirement),
         )
+        course_features = self._course_features_with_requirements(candidate, requirement)
+        feature_match = match_course_to_user(
+            course_features,
+            user_features,
+            config=self.score_calculator.config.feature_matching,
+        )
+        candidate_data = candidate.model_dump()
+        candidate_data["course_features"] = course_features
         return ScoredCourseCandidate(
-            **candidate.model_dump(),
+            **candidate_data,
             gpa_min=requirement.gpa_min,
             gpa_calculation_method=requirement.gpa_calculation_method,
             ielts_overall_min=requirement.ielts_overall_min,
@@ -162,7 +175,26 @@ class ScoringService:
             match_band=score_result.match_band,
             reason_tags=score_result.reason_tags,
             recommendation_reason=self._recommendation_reason(user_profile, requirement, score_result),
+            feature_match=feature_match,
         )
+
+    def _course_features_with_requirements(
+        self,
+        candidate: CourseCandidate,
+        requirement: NormalizedRequirement,
+    ) -> CourseFeatureProfile:
+        data = (candidate.course_features or CourseFeatureProfile()).model_dump()
+        data.update(
+            {
+                "admission_gpa_min": requirement.gpa_min,
+                "ielts_overall_min": requirement.ielts_overall_min,
+                "ielts_min_band_min": requirement.ielts_min_band_min,
+                "annual_fee_aud": candidate.tuition_fee_aud,
+                "duration_years": candidate.duration_max_years or candidate.duration_min_years,
+                "intake_tags": candidate.intakes,
+            }
+        )
+        return CourseFeatureProfile.model_validate(data)
 
     def _reason_tags(
         self,

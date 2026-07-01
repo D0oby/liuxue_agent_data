@@ -49,6 +49,7 @@ class UserProfileParser:
             faculty_preference=request.faculty_preference,
             school_preference=request.school_preference,
             accepts_pathway=request.accepts_pathway,
+            user_features=request.user_features,
         )
 
     def _normalize_gpa(self, gpa_user: float | None, gpa_scale: float) -> float | None:

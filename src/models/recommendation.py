@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from src.models.course_features import CourseFeatureProfile, MatchResult, UserFeatureProfile
+
 
 MatchBand = Literal["REACH", "MATCH", "SAFETY"]
 CheckStatus = Literal["pass", "fail", "warning", "unknown", "skip"]
@@ -78,6 +80,7 @@ class RecommendationRequest(BaseModel):
     faculty_preference: str | None = None
     school_preference: str | None = None
     accepts_pathway: bool = False
+    user_features: UserFeatureProfile | None = None
 
     @field_validator("target_major_keyword", "academic_background")
     @classmethod
@@ -138,6 +141,7 @@ class UserProfile(BaseModel):
     faculty_preference: str | None = None
     school_preference: str | None = None
     accepts_pathway: bool = False
+    user_features: UserFeatureProfile | None = None
 
 
 class QuerySpec(BaseModel):
@@ -177,6 +181,7 @@ class KeywordSearchHit(BaseModel):
     academic_requirements_json: dict[str, Any] = Field(default_factory=dict)
     application_details_json: dict[str, Any] = Field(default_factory=dict)
     supplementary_metadata_json: dict[str, Any] = Field(default_factory=dict)
+    course_features: CourseFeatureProfile | None = None
     source_url: str | None = None
     hit_fields: list[str] = Field(default_factory=list)
     keyword_score: float = 0.0
@@ -219,6 +224,7 @@ class CourseCandidate(BaseModel):
     academic_requirements_json: dict[str, Any] = Field(default_factory=dict)
     application_details_json: dict[str, Any] = Field(default_factory=dict)
     supplementary_metadata_json: dict[str, Any] = Field(default_factory=dict)
+    course_features: CourseFeatureProfile | None = None
     degree_type: str | None = None
     faculty: str | None = None
     school: str | None = None
@@ -296,6 +302,7 @@ class ScoredCourseCandidate(BaseModel):
     academic_requirements_json: dict[str, Any] = Field(default_factory=dict)
     application_details_json: dict[str, Any] = Field(default_factory=dict)
     supplementary_metadata_json: dict[str, Any] = Field(default_factory=dict)
+    course_features: CourseFeatureProfile | None = None
     degree_type: str | None = None
     faculty: str | None = None
     school: str | None = None
@@ -320,6 +327,7 @@ class ScoredCourseCandidate(BaseModel):
     match_band: MatchBand
     reason_tags: list[str] = Field(default_factory=list)
     recommendation_reason: str = ""
+    feature_match: MatchResult | None = None
 
 
 class ExcludedProgram(BaseModel):
@@ -348,6 +356,7 @@ class RecommendedProgram(BaseModel):
     score: float
     band: MatchBand
     recommendation_reason: str
+    feature_match: MatchResult | None = None
     evidence_snippets: list[EvidenceSnippet] = Field(default_factory=list)
     source_url: str | None = None
 

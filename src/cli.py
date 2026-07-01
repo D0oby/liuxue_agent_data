@@ -121,6 +121,26 @@ def _build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("query", help="Natural-language admissions query")
     search_parser.add_argument("--top-k", type=int, default=5, help="Number of matching chunks to print")
     search_parser.set_defaults(command="search-admissions")
+
+    feature_parser = subparsers.add_parser(
+        "generate-course-features",
+        help="Generate rule-based course feature profiles into courses.course_features",
+    )
+    feature_parser.add_argument("--limit", type=int, help="Maximum number of courses to process")
+    feature_parser.add_argument(
+        "--include-existing",
+        action="store_true",
+        help="Regenerate courses that already have course_features; manual overrides are preserved",
+    )
+    feature_parser.add_argument("--dry-run", action="store_true", help="Print counts without writing")
+    feature_parser.set_defaults(command="generate-course-features")
+
+    audit_parser = subparsers.add_parser(
+        "audit-course-features",
+        help="Audit stored course feature profiles and print deterministic findings",
+    )
+    audit_parser.add_argument("--limit", type=int, help="Maximum number of courses to inspect")
+    audit_parser.set_defaults(command="audit-course-features")
     return parser
 
 
@@ -236,6 +256,55 @@ def main() -> None:
             if result.source_url:
                 print(f"   Source: {result.source_url}")
             print(f"   {result.content[:500]}")
+        return
+
+    if args.command == "generate-course-features":
+        from src.recommendation.course_features import generate_course_features
+        from src.recommendation.feature_repository import CourseFeatureRepository
+
+        settings = load_settings()
+        repository = CourseFeatureRepository()
+        generated_count = 0
+        with connect(settings) as conn:
+            course_ids = repository.fetch_course_ids_for_generation(
+                conn,
+                limit=args.limit,
+                only_missing=not args.include_existing,
+            )
+            for course_id in course_ids:
+                record = repository.fetch_course(conn, course_id=course_id)
+                if record is None:
+                    continue
+                profile = generate_course_features(record.source, manual_override=record.manual_overrides)
+                generated_count += 1
+                if not args.dry_run:
+                    repository.save_course_features(
+                        conn,
+                        course_id=course_id,
+                        course_features=profile,
+                        manual_overrides=record.manual_overrides,
+                    )
+            if not args.dry_run:
+                conn.commit()
+        action = "Generated" if not args.dry_run else "Dry-run generated"
+        print(f"{action} {generated_count}/{len(course_ids)} course feature profiles.")
+        return
+
+    if args.command == "audit-course-features":
+        from src.recommendation.course_features import audit_course_feature_profiles
+        from src.recommendation.feature_repository import CourseFeatureRepository
+
+        settings = load_settings()
+        repository = CourseFeatureRepository()
+        with connect(settings) as conn:
+            findings = audit_course_feature_profiles(
+                repository.fetch_feature_audit_rows(conn, limit=args.limit)
+            )
+        if not findings:
+            print("No course feature profile audit findings.")
+            return
+        for finding in findings:
+            print(f"{finding.course_id}\t{finding.code}\t{finding.course_name}\t{finding.message}")
         return
 
     raise ValueError(f"Unsupported command: {args.command}")
