@@ -78,6 +78,24 @@ class CourseFeatureProfileSchemaTests(unittest.TestCase):
 
         self.assertEqual(rows["course-1"].course_features["ai_relevance"], 4)
 
+    def test_repository_falls_back_when_course_feature_column_is_missing(self) -> None:
+        conn = _MissingFeatureColumnConnection()
+
+        rows = RecommendationRepository().fetch_courses_by_ids(
+            conn,
+            course_ids=["course-1"],
+        )
+
+        self.assertIsNone(rows["course-1"].course_features)
+        self.assertTrue(conn.rolled_back)
+
+    def test_repository_does_not_swallow_unrelated_database_errors(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "database is unavailable"):
+            RecommendationRepository().fetch_courses_by_ids(
+                _UnrelatedDatabaseErrorConnection(),
+                course_ids=["course-1"],
+            )
+
 
 class _FeatureProfileRepository:
     def search_courses_by_keywords(self, conn, *, keywords: list[str], limit: int) -> list[CourseSearchRow]:
@@ -144,6 +162,71 @@ class _FeatureProfileCursor:
                 {"ai_relevance": 4},
             )
         ]
+
+
+class _MissingFeatureColumnConnection:
+    def __init__(self) -> None:
+        self.rolled_back = False
+
+    def cursor(self):
+        return _MissingFeatureColumnCursor()
+
+    def rollback(self) -> None:
+        self.rolled_back = True
+
+
+class _MissingFeatureColumnCursor:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql: str, params: list[object]) -> None:
+        if "c.course_features" in sql:
+            raise RuntimeError("column c.course_features does not exist")
+
+    def fetchall(self):
+        return [
+            (
+                "course-1",
+                "Master of Data Science",
+                "Master of Data Science",
+                "123456A",
+                1.5,
+                1.5,
+                56000,
+                "Data science admission requirements.",
+                "6.5 (6.0)",
+                6.5,
+                6.0,
+                "https://www.sydney.edu.au/courses/test.html",
+                None,
+                None,
+                None,
+                None,
+                {},
+                {},
+                {},
+                None,
+            )
+        ]
+
+
+class _UnrelatedDatabaseErrorConnection:
+    def cursor(self):
+        return _UnrelatedDatabaseErrorCursor()
+
+
+class _UnrelatedDatabaseErrorCursor:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql: str, params: list[object]) -> None:
+        raise RuntimeError("database is unavailable")
 
 
 if __name__ == "__main__":

@@ -700,3 +700,6 @@ curl -X POST http://127.0.0.1:8000/recommendations/usyd \
 cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
 PYTHONPATH=. .venv/bin/python -m unittest discover -s tests -v
 ```
+
+课程画像 rollout 验证步骤见
+[`docs/runbooks/course-feature-profile-rollout-smoke-checks.md`](docs/runbooks/course-feature-profile-rollout-smoke-checks.md)。

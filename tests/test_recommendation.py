@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import unittest
+from unittest.mock import patch
+
+import pandas as pd
 
 from src.config import (
     BandConfig,
@@ -34,16 +37,25 @@ from src.recommendation.agent import (
     RunEligibilityGateTool,
     SearchProgramTool,
 )
-from src.dashboard import build_requirement_checks_dataframe
+from src.dashboard import (
+    _build_courses_query,
+    _build_keyword_mask,
+    _feature_profile_storage_warning,
+    _format_recommendation_error,
+    _format_semantic_result_source_bits,
+    _highlight_query_terms,
+    _read_courses_dataframe,
+    build_requirement_checks_dataframe,
+)
 from src.recommendation.eligibility import EligibilityGate
 from src.recommendation.plan import PlanAssembler
 from src.recommendation.profile import UserProfileParser
 from src.recommendation.query_builder import QueryBuilder
-from src.recommendation.repository import CourseSearchRow
+from src.recommendation.repository import CourseSearchRow, RecommendationRepository
 from src.recommendation.requirements import RequirementNormalizer, RequirementResult, RequirementService
 from src.recommendation.retrieval import AdmissionsRAGService, CandidateMerger, KeywordRetriever, VectorRetriever
 from src.recommendation.scoring import BandClassifier, ScoreCalculator, ScoringService
-from src.recommendation.service import RecommendationService
+from src.recommendation.service import RecommendationService, RecommendationServiceError
 from src.vector_store.storage import SearchResult
 
 
@@ -386,6 +398,24 @@ class RecommendationServiceTests(unittest.TestCase):
         self.assertFalse(recommended_ids & excluded_ids)
         self.assertIn("course-1", excluded_ids)
 
+    def test_recommendation_runs_when_feature_profile_columns_are_missing(self) -> None:
+        conn = MissingFeatureProfileStorageConnection()
+        service = _build_service(
+            RecommendationRepository(),
+            embedding_client=None,
+            connection_factory=_connection_factory_for(conn),
+        )
+
+        response = service.recommend(_request(), request_id="req-missing-feature-columns")
+
+        self.assertEqual(response.metadata.candidate_count, 1)
+        self.assertEqual(response.metadata.scored_candidate_count, 1)
+        self.assertTrue(response.metadata.degraded_retrieval)
+        self.assertEqual(response.eligibility_summary.eligible_count, 1)
+        self.assertGreaterEqual(conn.rollback_count, 1)
+        self.assertTrue(response.match_programs)
+        self.assertIsNotNone(response.match_programs[0].feature_match)
+
 
 class DashboardHelperTests(unittest.TestCase):
     def test_requirement_checks_render_to_dataframe(self) -> None:
@@ -395,6 +425,157 @@ class DashboardHelperTests(unittest.TestCase):
 
         self.assertEqual(list(dataframe.columns), ["条件", "用户情况", "学校要求", "判断", "原因"])
         self.assertIn("GPA / WAM", set(dataframe["条件"]))
+
+    def test_keyword_search_matches_course_feature_tags(self) -> None:
+        dataframe = pd.DataFrame(
+            [
+                {
+                    "course_name": "Master of Analytics",
+                    "cricos": "000001A",
+                    "academic_requirement_text": "",
+                    "raw_english_requirement": "",
+                    "academic_summary": "",
+                    "application_flags_display": "",
+                    "required_documents_display": "",
+                    "language_tests_display": "",
+                    "course_features": {
+                        "discipline_tags": ["data science"],
+                        "knowledge_tags": ["machine learning"],
+                        "career_tags": ["data scientist"],
+                        "background_fit_tags": ["math background"],
+                    },
+                },
+                {
+                    "course_name": "Master of Arts",
+                    "cricos": "000002A",
+                    "academic_requirement_text": "",
+                    "raw_english_requirement": "",
+                    "academic_summary": "",
+                    "application_flags_display": "",
+                    "required_documents_display": "",
+                    "language_tests_display": "",
+                    "course_features": {
+                        "discipline_tags": ["arts"],
+                        "knowledge_tags": ["communication"],
+                    },
+                },
+            ]
+        )
+
+        mask = _build_keyword_mask(dataframe, "machine learning")
+
+        self.assertEqual(mask.tolist(), [True, False])
+
+    def test_keyword_search_still_matches_old_courses_without_feature_profiles(self) -> None:
+        dataframe = pd.DataFrame(
+            [
+                {
+                    "course_name": "Master of Computer Science",
+                    "cricos": "000001A",
+                    "academic_requirement_text": "",
+                    "raw_english_requirement": "",
+                    "academic_summary": "",
+                    "application_flags_display": "",
+                    "required_documents_display": "",
+                    "language_tests_display": "",
+                }
+            ]
+        )
+
+        mask = _build_keyword_mask(dataframe, "computer")
+
+        self.assertEqual(mask.tolist(), [True])
+
+    def test_highlight_query_terms_escapes_text_and_marks_matches(self) -> None:
+        highlighted = _highlight_query_terms("Portfolio <required> for design portfolio.", "portfolio")
+
+        self.assertIn("<mark>Portfolio</mark>", highlighted)
+        self.assertIn("&lt;required&gt;", highlighted)
+
+    def test_semantic_result_source_bits_include_field_and_url(self) -> None:
+        result = SearchResult(
+            course_id="course-1",
+            course_name="Master of Design",
+            cricos="123456A",
+            chunk_kind="application",
+            content="Portfolio required.",
+            source_url="https://www.sydney.edu.au/courses/test.html",
+            similarity=0.88,
+            metadata={"field": "application_details_json"},
+        )
+
+        source_bits = _format_semantic_result_source_bits(result)
+
+        self.assertEqual(
+            source_bits,
+            ["application_details_json", "[官网来源](https://www.sydney.edu.au/courses/test.html)"],
+        )
+
+    def test_courses_query_can_fallback_when_feature_columns_are_missing(self) -> None:
+        query = _build_courses_query(include_feature_columns=False)
+
+        self.assertNotIn("c.course_features", query)
+        self.assertIn("null::jsonb as course_features", query)
+        self.assertIn("null::jsonb as course_feature_overrides", query)
+
+    def test_courses_dataframe_fallback_marks_feature_storage_unavailable(self) -> None:
+        calls: list[str] = []
+
+        def fake_read_sql(sql: str, conn):
+            calls.append(sql)
+            if len(calls) == 1:
+                raise RuntimeError("column c.course_features does not exist")
+            return pd.DataFrame([{"course_features": None, "course_feature_overrides": None}])
+
+        with patch("src.dashboard.pd.read_sql", side_effect=fake_read_sql):
+            dataframe = _read_courses_dataframe(object())
+
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(dataframe.attrs["feature_profile_storage_available"])
+
+    def test_courses_dataframe_normal_path_marks_feature_storage_available(self) -> None:
+        with patch(
+            "src.dashboard.pd.read_sql",
+            return_value=pd.DataFrame([{"course_features": {"ai_relevance": 4}}]),
+        ):
+            dataframe = _read_courses_dataframe(object())
+
+        self.assertTrue(dataframe.attrs["feature_profile_storage_available"])
+
+    def test_feature_profile_storage_warning_explains_degraded_mode(self) -> None:
+        message = _feature_profile_storage_warning()
+
+        self.assertIn("课程画像", message)
+        self.assertIn("migration", message)
+
+    def test_recommendation_error_message_identifies_missing_feature_profile_migration(self) -> None:
+        message = _format_recommendation_error(
+            _recommendation_error_from(RuntimeError("column c.course_features does not exist"))
+        )
+
+        self.assertIn("课程画像", message)
+        self.assertIn("migration", message)
+        self.assertNotEqual(message, "推荐失败：Recommendation request failed.")
+
+    def test_recommendation_error_message_identifies_database_connection_failure(self) -> None:
+        message = _format_recommendation_error(
+            _recommendation_error_from(RuntimeError("connection to server at 127.0.0.1 failed"))
+        )
+
+        self.assertIn("数据库连接失败", message)
+
+    def test_recommendation_error_message_identifies_vector_configuration_failure(self) -> None:
+        message = _format_recommendation_error(
+            _recommendation_error_from(RuntimeError("Vector retrieval requires an embedding client."))
+        )
+
+        self.assertIn("向量检索", message)
+
+    def test_recommendation_error_message_keeps_unexpected_errors_safe(self) -> None:
+        message = _format_recommendation_error(_recommendation_error_from(ValueError("unexpected bad input")))
+
+        self.assertIn("推荐失败", message)
+        self.assertIn("unexpected bad input", message)
 
 
 class FakeRecommendationRepository:
@@ -450,12 +631,88 @@ class FakeVectorStore:
         ][:top_k]
 
 
+class MissingFeatureProfileStorageConnection:
+    def __init__(self) -> None:
+        self.rollback_count = 0
+
+    def cursor(self):
+        return MissingFeatureProfileStorageCursor()
+
+    def rollback(self) -> None:
+        self.rollback_count += 1
+
+
+class MissingFeatureProfileStorageCursor:
+    def __init__(self) -> None:
+        self.sql = ""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql: str, params: list[object]) -> None:
+        self.sql = sql
+        if "from courses c" in sql and "c.course_features" in sql:
+            raise RuntimeError("column c.course_features does not exist")
+
+    def fetchall(self):
+        if "from courses c" in self.sql:
+            return [
+                (
+                    "course-1",
+                    "Master of Computer Science",
+                    "Master of Computer Science",
+                    "123456A",
+                    1.5,
+                    1.5,
+                    56000,
+                    "Computer science admission requirements include a bachelor's degree.",
+                    "6.5 (6.0)",
+                    6.5,
+                    6.0,
+                    "https://www.sydney.edu.au/courses/test.html",
+                    None,
+                    None,
+                    None,
+                    None,
+                    {},
+                    {},
+                    {},
+                    None,
+                )
+            ]
+        if "from course_intakes" in self.sql:
+            return [("course-1", "FEB"), ("course-1", "JUL")]
+        if "from course_admission_requirements" in self.sql:
+            return [
+                (
+                    "course-1",
+                    "Admission requires a bachelor's degree in a related discipline.",
+                    "6.5 (6.0)",
+                    6.5,
+                    6.0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    {},
+                    {},
+                    {},
+                    {},
+                    "https://www.sydney.edu.au/courses/test.html",
+                )
+            ]
+        return []
+
+
 @contextmanager
 def _fake_connection_factory(settings: Settings):
     yield object()
 
 
-def _build_service(repository, embedding_client=None) -> RecommendationService:
+def _build_service(repository, embedding_client=None, connection_factory=_fake_connection_factory) -> RecommendationService:
     config = RecommendationConfig(
         retrieval=RetrievalConfig(keyword_top_k=30, vector_top_k=30, final_candidate_limit=50),
         rules=RulesConfig(enable_ielts_band_gate=True),
@@ -494,8 +751,23 @@ def _build_service(repository, embedding_client=None) -> RecommendationService:
     return RecommendationService(
         settings=settings,
         planning_agent=agent,
-        connection_factory=_fake_connection_factory,
+        connection_factory=connection_factory,
     )
+
+
+def _connection_factory_for(conn):
+    @contextmanager
+    def factory(settings: Settings):
+        yield conn
+
+    return factory
+
+
+def _recommendation_error_from(cause: Exception) -> RecommendationServiceError:
+    try:
+        raise RecommendationServiceError("Recommendation request failed.") from cause
+    except RecommendationServiceError as exc:
+        return exc
 
 
 def _request(gpa: float = 82) -> RecommendationRequest:

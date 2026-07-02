@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import html
 import json
+import re
 from typing import Any
 
 import pandas as pd
@@ -41,8 +43,49 @@ APPLICATION_FILTERS = {
 def fetch_dashboard_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     settings = load_settings()
     with connect(settings) as conn:
-        courses_df = pd.read_sql(
+        courses_df = _read_courses_dataframe(conn)
+        intakes_df = pd.read_sql(
             """
+            select
+                c.id as course_id,
+                c.course_name,
+                ci.intake_month,
+                ci.sort_order
+            from course_intakes ci
+            join courses c on c.id = ci.course_id
+            order by c.course_name, ci.sort_order
+            """,
+            conn,
+        )
+    return courses_df, intakes_df
+
+
+def _read_courses_dataframe(conn) -> pd.DataFrame:
+    try:
+        courses_df = pd.read_sql(_build_courses_query(include_feature_columns=True), conn)
+        courses_df.attrs["feature_profile_storage_available"] = True
+        return courses_df
+    except Exception as exc:
+        if not _is_missing_feature_column_error(exc):
+            raise
+        courses_df = pd.read_sql(_build_courses_query(include_feature_columns=False), conn)
+        courses_df.attrs["feature_profile_storage_available"] = False
+        return courses_df
+
+
+def _build_courses_query(*, include_feature_columns: bool = True) -> str:
+    feature_columns = (
+        """
+                c.course_features,
+                c.course_feature_overrides
+        """
+        if include_feature_columns
+        else """
+                null::jsonb as course_features,
+                null::jsonb as course_feature_overrides
+        """
+    )
+    return f"""
             select
                 c.id,
                 c.course_name,
@@ -72,30 +115,54 @@ def fetch_dashboard_data() -> tuple[pd.DataFrame, pd.DataFrame]:
                 car.ielts_speaking,
                 car.ielts_writing,
                 car.last_verified_at,
-                c.course_features,
-                c.course_feature_overrides
+{feature_columns}
             from courses c
             left join course_admission_requirements car
               on car.course_id = c.id
              and car.is_current = true
             order by c.course_name, c.source_row_number
-            """,
-            conn,
-        )
-        intakes_df = pd.read_sql(
             """
-            select
-                c.id as course_id,
-                c.course_name,
-                ci.intake_month,
-                ci.sort_order
-            from course_intakes ci
-            join courses c on c.id = ci.course_id
-            order by c.course_name, ci.sort_order
-            """,
-            conn,
-        )
-    return courses_df, intakes_df
+
+
+def _is_missing_feature_column_error(exc: Exception) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        message = str(current).lower()
+        if "course_feature" in message and "does not exist" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _feature_profile_storage_warning() -> str:
+    return (
+        "课程画像数据暂不可用：当前数据库尚未应用 course_features migration，"
+        "课程查询和推荐会以空画像降级运行。完成 migration 并生成画像后会显示标签和画像分数。"
+    )
+
+
+def _format_recommendation_error(exc: RecommendationServiceError) -> str:
+    messages = _exception_chain_messages(exc)
+    normalized = " ".join(messages).lower()
+    if "course_feature" in normalized and "does not exist" in normalized:
+        return "推荐失败：课程画像字段尚未完成 migration。请先应用 course_features migration，或确认推荐仓库 fallback 已启用。"
+    if "connection to server" in normalized or "connection refused" in normalized or "operation not permitted" in normalized:
+        return "推荐失败：数据库连接失败。请确认 PostgreSQL 正在运行、DATABASE_URL 正确，并且当前进程有本地端口访问权限。"
+    if "vector retrieval" in normalized or "embedding" in normalized or "chromadb" in normalized:
+        return "推荐失败：向量检索或 embedding 配置不可用。请检查 OPENAI_API_KEY、embedding 配置和 ChromaDB 数据。"
+    detail = messages[-1] if messages else str(exc)
+    return f"推荐失败：{detail}"
+
+
+def _exception_chain_messages(exc: BaseException) -> list[str]:
+    messages: list[str] = []
+    current: BaseException | None = exc
+    while current is not None:
+        message = str(current).strip()
+        if message:
+            messages.append(message)
+        current = current.__cause__ or current.__context__
+    return messages
 
 
 def build_duration_display(courses_df: pd.DataFrame) -> pd.Series:
@@ -141,6 +208,21 @@ def _trim_text(value: str, limit: int = 140) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 1].rstrip() + "…"
+
+
+def _highlight_query_terms(text: str, query: str) -> str:
+    highlighted = html.escape(str(text or ""))
+    for term in _query_terms(query):
+        pattern = re.compile(re.escape(html.escape(term)), re.IGNORECASE)
+        highlighted = pattern.sub(lambda match: f"<mark>{match.group(0)}</mark>", highlighted)
+    return highlighted
+
+
+def _query_terms(query: str) -> list[str]:
+    terms = [chunk.strip() for chunk in re.split(r"\s+", query.strip()) if len(chunk.strip()) >= 2]
+    if not terms and query.strip():
+        terms = [query.strip()]
+    return sorted(set(terms), key=len, reverse=True)
 
 
 def _format_language_tests(details: dict[str, Any]) -> str:
@@ -209,6 +291,7 @@ def enrich_courses_df(courses_df: pd.DataFrame) -> pd.DataFrame:
     )
     enriched_df["academic_summary"] = enriched_df["academic_requirement_text"].fillna("").apply(_trim_text)
     enriched_df["source_url_display"] = enriched_df["source_url"].fillna("")
+    enriched_df["feature_tags_display"] = enriched_df["course_features"].apply(_format_feature_search_text)
 
     for _, field_name in APPLICATION_FILTERS.items():
         enriched_df[field_name] = enriched_df["application_details_json"].apply(
@@ -221,7 +304,7 @@ def enrich_courses_df(courses_df: pd.DataFrame) -> pd.DataFrame:
 def apply_filters(courses_df: pd.DataFrame, intakes_df: pd.DataFrame) -> pd.DataFrame:
     st.sidebar.header("筛选条件")
 
-    keyword = st.sidebar.text_input("关键词", placeholder="课程名 / CRICOS / 录取要求")
+    keyword = st.sidebar.text_input("关键词", placeholder="课程名 / CRICOS / 录取要求 / 画像标签")
     selected_intakes = st.sidebar.multiselect("开学季", INTAKE_ORDER)
     only_crawled = st.sidebar.checkbox("只看已补官网招生信息", value=True)
     selected_application_filters = st.sidebar.multiselect("申请特征", list(APPLICATION_FILTERS.keys()))
@@ -331,6 +414,7 @@ def _build_keyword_mask(display_df: pd.DataFrame, keyword: str) -> pd.Series:
         "application_flags_display",
         "required_documents_display",
         "language_tests_display",
+        "feature_tags_display",
     ]
     mask = pd.Series(False, index=display_df.index)
     for column in searchable_columns:
@@ -339,6 +423,10 @@ def _build_keyword_mask(display_df: pd.DataFrame, keyword: str) -> pd.Series:
         mask = mask | display_df[column].fillna("").astype(str).str.lower().str.contains(
             normalized_keyword,
             regex=False,
+        )
+    if "course_features" in display_df:
+        mask = mask | display_df["course_features"].apply(
+            lambda value: normalized_keyword in _format_feature_search_text(value).lower()
         )
     return mask
 
@@ -495,18 +583,38 @@ def render_admission_search() -> None:
         st.info("没有找到匹配的录取要求。")
         return
 
-    result_rows = [
-        {
-            "课程": result.course_name,
-            "CRICOS": result.cricos,
-            "类型": _format_chunk_kind(result.chunk_kind),
-            "匹配度": f"{result.similarity:.3f}",
-            "摘要": _trim_text(result.content, limit=260),
-            "来源": result.source_url or "",
-        }
-        for result in results
-    ]
-    st.dataframe(pd.DataFrame(result_rows), width="stretch", hide_index=True)
+    render_admission_search_results(results, normalized_query)
+
+
+def render_admission_search_results(results: list[Any], query: str) -> None:
+    best_similarity = max(result.similarity for result in results)
+    summary_cols = st.columns(3)
+    summary_cols[0].metric("命中结果", len(results))
+    summary_cols[1].metric("最高匹配度", f"{best_similarity:.3f}")
+    summary_cols[2].metric("涉及课程", len({result.course_id for result in results}))
+
+    for index, result in enumerate(results, start=1):
+        with st.container(border=True):
+            header_left, header_right = st.columns([4, 1])
+            header_left.markdown(f"**{index}. {result.course_name}**")
+            header_left.caption(f"CRICOS {result.cricos or '-'} | {_format_chunk_kind(result.chunk_kind)}")
+            header_right.metric("匹配度", f"{result.similarity:.3f}")
+            st.markdown(
+                _highlight_query_terms(_trim_text(result.content, limit=520), query),
+                unsafe_allow_html=True,
+            )
+            source_bits = _format_semantic_result_source_bits(result)
+            if source_bits:
+                st.caption(" | ".join(source_bits))
+
+
+def _format_semantic_result_source_bits(result: Any) -> list[str]:
+    metadata = result.metadata if isinstance(result.metadata, dict) else {}
+    field_name = metadata.get("field")
+    source_bits = [str(field_name)] if field_name else []
+    if result.source_url:
+        source_bits.append(f"[官网来源]({result.source_url})")
+    return source_bits
 
 
 def _format_chunk_kind(chunk_kind: str) -> str:
@@ -610,7 +718,7 @@ def render_recommendation_console() -> None:
             with st.spinner("正在运行 hard filter 并生成下一层匹配..."):
                 st.session_state["usyd_recommendation_response"] = run_usyd_recommendation(request)
         except RecommendationServiceError as exc:
-            st.error(f"推荐失败：{exc}")
+            st.error(_format_recommendation_error(exc))
             return
         except Exception as exc:  # pragma: no cover - Streamlit-facing safety net
             st.error(f"推荐失败：{exc}")
@@ -1019,6 +1127,19 @@ def _format_tags(tags: list[str]) -> str:
     return ", ".join(tags) if tags else "-"
 
 
+def _format_feature_search_text(value: Any) -> str:
+    profile = _feature_profile(value)
+    tags: list[str] = []
+    for field_name in (
+        "discipline_tags",
+        "knowledge_tags",
+        "career_tags",
+        "background_fit_tags",
+    ):
+        tags.extend(getattr(profile, field_name))
+    return ", ".join(dict.fromkeys(tags))
+
+
 def _split_csv(value: str) -> list[str]:
     return [chunk.strip() for chunk in value.split(",") if chunk.strip()]
 
@@ -1029,6 +1150,12 @@ def render_dashboard() -> None:
         """
         <style>
         .block-container {padding-top: 1.2rem; padding-bottom: 1.2rem; max-width: 1500px;}
+        mark {
+            background: #fff1a8;
+            color: #1f1f1f;
+            padding: 0 0.12rem;
+            border-radius: 3px;
+        }
         div[data-testid="stMetric"] {
             background: #f7f5ef;
             border: 1px solid #d8d1c3;
@@ -1061,6 +1188,8 @@ def render_dashboard() -> None:
     except Exception as exc:  # pragma: no cover - Streamlit-facing safety net
         st.error(f"课程数据加载失败：{exc}。如果刚更新课程画像功能，请先运行数据库 migration。")
         return
+    if not courses_df.attrs.get("feature_profile_storage_available", True):
+        st.warning(_feature_profile_storage_warning())
     intake_map = build_intake_map(intakes_df)
     courses_df["intakes"] = courses_df["id"].map(intake_map).fillna("")
     courses_df["duration_display"] = build_duration_display(courses_df)
@@ -1075,6 +1204,7 @@ def render_dashboard() -> None:
     export_df = display_df[
         [
             "course_name",
+            "feature_tags_display",
             "cricos",
             "admission_source_label",
             "duration_display",
@@ -1100,6 +1230,7 @@ def render_dashboard() -> None:
     ].rename(
         columns={
             "course_name": "课程名",
+            "feature_tags_display": "画像标签",
             "cricos": "CRICOS",
             "admission_source_label": "招生来源",
             "duration_display": "学制区间",
