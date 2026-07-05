@@ -38,6 +38,52 @@ APPLICATION_FILTERS = {
     "References": "requires_references",
     "Work experience": "requires_work_experience",
 }
+DEFAULT_UI_LANGUAGE = "en"
+UI_LANGUAGE_OPTIONS = ["EN", "中文"]
+UI_TEXT = {
+    "app_title": {
+        "en": "USYD Recommendation Console",
+        "zh": "USYD 留学方案工作台",
+    },
+    "app_caption": {
+        "en": "Recommendations use the read-only RAG + Agent flow; course search keeps the Excel and official admissions backend.",
+        "zh": "推荐方案使用只读 RAG + Agent 链路；课程查询保留 Excel 与官网招生信息后台。",
+    },
+    "workspace_label": {
+        "en": "Workspace",
+        "zh": "工作区",
+    },
+    "workspace_recommendation": {
+        "en": "Recommendation Plan",
+        "zh": "推荐方案",
+    },
+    "workspace_course_query": {
+        "en": "Course Search",
+        "zh": "课程查询",
+    },
+    "language_label": {
+        "en": "Language",
+        "zh": "语言",
+    },
+}
+
+
+def normalize_ui_language(language: str | None) -> str:
+    return "zh" if str(language or "").lower() in {"zh", "中文", "chinese"} else DEFAULT_UI_LANGUAGE
+
+
+def ui_language_label(language: str | None = DEFAULT_UI_LANGUAGE) -> str:
+    return "中文" if normalize_ui_language(language) == "zh" else "EN"
+
+
+def ui_language_from_label(label: str | None) -> str:
+    return "zh" if label == "中文" else DEFAULT_UI_LANGUAGE
+
+
+def ui_text(key: str, language: str | None = DEFAULT_UI_LANGUAGE) -> str:
+    translations = UI_TEXT.get(key, {})
+    normalized = normalize_ui_language(language)
+    return translations.get(normalized) or translations.get(DEFAULT_UI_LANGUAGE) or key
 
 
 def fetch_dashboard_data() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1167,17 +1213,31 @@ def render_dashboard() -> None:
         unsafe_allow_html=True,
     )
 
-    st.title("USYD 留学方案工作台")
-    st.caption("推荐方案使用只读 RAG + Agent 链路；课程查询保留 Excel 与官网招生信息后台。")
+    language = normalize_ui_language(st.session_state.get("ui_language", DEFAULT_UI_LANGUAGE))
+    header_left, header_right = st.columns([4, 1])
+    with header_right:
+        selected_language_label = st.segmented_control(
+            ui_text("language_label", language),
+            options=UI_LANGUAGE_OPTIONS,
+            default=ui_language_label(language),
+            key="ui_language_selector",
+            label_visibility="collapsed",
+        )
+    language = ui_language_from_label(selected_language_label)
+    st.session_state["ui_language"] = language
+
+    with header_left:
+        st.title(ui_text("app_title", language))
+        st.caption(ui_text("app_caption", language))
 
     mode = st.radio(
-        "工作区",
-        ["推荐方案", "课程查询"],
+        ui_text("workspace_label", language),
+        [ui_text("workspace_recommendation", language), ui_text("workspace_course_query", language)],
         horizontal=True,
         label_visibility="collapsed",
     )
 
-    if mode == "推荐方案":
+    if mode == ui_text("workspace_recommendation", language):
         render_recommendation_console()
         return
 

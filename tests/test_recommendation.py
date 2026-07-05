@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
@@ -46,6 +46,9 @@ from src.dashboard import (
     _highlight_query_terms,
     _read_courses_dataframe,
     build_requirement_checks_dataframe,
+    render_admission_search,
+    render_dashboard,
+    ui_text,
 )
 from src.recommendation.eligibility import EligibilityGate
 from src.recommendation.plan import PlanAssembler
@@ -418,6 +421,52 @@ class RecommendationServiceTests(unittest.TestCase):
 
 
 class DashboardHelperTests(unittest.TestCase):
+    def test_dashboard_ui_language_defaults_to_english_and_supports_chinese(self) -> None:
+        self.assertEqual(ui_text("app_title"), "USYD Recommendation Console")
+        self.assertEqual(ui_text("app_title", "zh"), "USYD 留学方案工作台")
+
+    def test_dashboard_ui_language_missing_key_falls_back_safely(self) -> None:
+        self.assertEqual(ui_text("missing.translation", "zh"), "missing.translation")
+
+    def test_dashboard_shell_renders_english_by_default(self) -> None:
+        with (
+            patch("src.dashboard.st") as streamlit,
+            patch("src.dashboard.render_recommendation_console") as render_recommendation,
+            patch("src.dashboard.render_admission_search"),
+            patch("src.dashboard.fetch_dashboard_data", side_effect=AssertionError("course data should not load")),
+        ):
+            streamlit.session_state = {}
+            streamlit.columns.return_value = [MagicMock(), MagicMock()]
+            streamlit.segmented_control.return_value = "EN"
+            streamlit.radio.return_value = "Recommendation Plan"
+
+            render_dashboard()
+
+        streamlit.title.assert_called_once_with("USYD Recommendation Console")
+        streamlit.caption.assert_called_once_with(
+            "Recommendations use the read-only RAG + Agent flow; course search keeps the Excel and official admissions backend."
+        )
+        render_recommendation.assert_called_once_with()
+
+    def test_dashboard_header_switch_updates_session_language(self) -> None:
+        with (
+            patch("src.dashboard.st") as streamlit,
+            patch("src.dashboard.render_recommendation_console"),
+            patch("src.dashboard.render_admission_search"),
+            patch("src.dashboard.fetch_dashboard_data", side_effect=AssertionError("course data should not load")),
+        ):
+            streamlit.session_state = {}
+            streamlit.columns.return_value = [MagicMock(), MagicMock()]
+            streamlit.segmented_control.return_value = "中文"
+            streamlit.radio.return_value = "推荐方案"
+
+            render_dashboard()
+
+        streamlit.segmented_control.assert_called_once()
+        self.assertEqual(streamlit.segmented_control.call_args.kwargs["options"], ["EN", "中文"])
+        self.assertEqual(streamlit.session_state["ui_language"], "zh")
+        streamlit.title.assert_called_once_with("USYD 留学方案工作台")
+
     def test_requirement_checks_render_to_dataframe(self) -> None:
         outcome = _eligibility_outcome()
 
@@ -510,6 +559,21 @@ class DashboardHelperTests(unittest.TestCase):
             source_bits,
             ["application_details_json", "[官网来源](https://www.sydney.edu.au/courses/test.html)"],
         )
+
+    def test_semantic_search_empty_results_are_normal_no_results_state(self) -> None:
+        with (
+            patch("src.dashboard.run_admission_semantic_search", return_value=[]),
+            patch("src.dashboard.st") as streamlit,
+        ):
+            streamlit.text_input.return_value = "portfolio"
+            streamlit.number_input.return_value = 5
+            streamlit.form_submit_button.return_value = True
+            streamlit.columns.return_value = [MagicMock(), MagicMock()]
+
+            render_admission_search()
+
+        streamlit.info.assert_called_once_with("没有找到匹配的录取要求。")
+        streamlit.error.assert_not_called()
 
     def test_courses_query_can_fallback_when_feature_columns_are_missing(self) -> None:
         query = _build_courses_query(include_feature_columns=False)
