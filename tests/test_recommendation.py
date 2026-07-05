@@ -38,6 +38,7 @@ from src.recommendation.agent import (
     SearchProgramTool,
 )
 from src.dashboard import (
+    build_course_export_dataframe,
     _build_courses_query,
     _build_keyword_mask,
     _feature_profile_storage_warning,
@@ -46,8 +47,10 @@ from src.dashboard import (
     _highlight_query_terms,
     _read_courses_dataframe,
     build_requirement_checks_dataframe,
+    localized_document_path,
     render_admission_search,
     render_dashboard,
+    render_recommendation_console,
     ui_text,
 )
 from src.recommendation.eligibility import EligibilityGate
@@ -466,14 +469,61 @@ class DashboardHelperTests(unittest.TestCase):
         self.assertEqual(streamlit.segmented_control.call_args.kwargs["options"], ["EN", "中文"])
         self.assertEqual(streamlit.session_state["ui_language"], "zh")
         streamlit.title.assert_called_once_with("USYD 留学方案工作台")
+        streamlit.markdown.assert_any_call("[文档](README.zh.md)")
+
+    def test_recommendation_workspace_renders_english_form_copy_by_default(self) -> None:
+        with patch("src.dashboard.st") as streamlit:
+            streamlit.session_state = {}
+            streamlit.form.return_value = MagicMock()
+            streamlit.columns.side_effect = lambda spec: [MagicMock() for _ in range(spec if isinstance(spec, int) else len(spec))]
+            streamlit.form_submit_button.return_value = False
+
+            render_recommendation_console()
+
+        streamlit.subheader.assert_called_once_with("Eligibility Screening / Hard Filter")
+        streamlit.caption.assert_called_once_with(
+            "Domestic academic results use the University of Sydney arithmetic-average method across all subjects."
+        )
+        streamlit.text_input.assert_any_call("Target area", value="Computer Science")
+        streamlit.text_area.assert_called_once_with(
+            "Completed courses",
+            value="Programming\nStatistics\nDatabase Systems",
+            help="Use one course per line, or separate courses with commas.",
+        )
+        streamlit.form_submit_button.assert_called_once_with(
+            "Run Eligibility Screening", type="primary", use_container_width=True
+        )
+        streamlit.info.assert_called_once_with("Complete the user profile, then run eligibility screening.")
+
+    def test_recommendation_workspace_renders_chinese_form_copy_when_selected(self) -> None:
+        with patch("src.dashboard.st") as streamlit:
+            streamlit.session_state = {"ui_language": "zh"}
+            streamlit.form.return_value = MagicMock()
+            streamlit.columns.side_effect = lambda spec: [MagicMock() for _ in range(spec if isinstance(spec, int) else len(spec))]
+            streamlit.form_submit_button.return_value = False
+
+            render_recommendation_console()
+
+        streamlit.subheader.assert_called_once_with("申请资格筛选 / Hard Filter")
+        streamlit.text_input.assert_any_call("目标方向", value="计算机")
+        streamlit.form_submit_button.assert_called_once_with("运行申请资格筛选", type="primary", use_container_width=True)
+        streamlit.info.assert_called_once_with("填写用户画像后运行申请资格筛选。")
 
     def test_requirement_checks_render_to_dataframe(self) -> None:
         outcome = _eligibility_outcome()
 
-        dataframe = build_requirement_checks_dataframe(outcome.decisions[0].requirement_checks)
+        dataframe = build_requirement_checks_dataframe(outcome.decisions[0].requirement_checks, language="zh")
 
         self.assertEqual(list(dataframe.columns), ["条件", "用户情况", "学校要求", "判断", "原因"])
         self.assertIn("GPA / WAM", set(dataframe["条件"]))
+
+    def test_requirement_checks_render_to_english_dataframe_headers(self) -> None:
+        outcome = _eligibility_outcome()
+
+        dataframe = build_requirement_checks_dataframe(outcome.decisions[0].requirement_checks, language="en")
+
+        self.assertEqual(list(dataframe.columns), ["Requirement", "User value", "Course requirement", "Status", "Reason"])
+        self.assertIn("GPA / WAM", set(dataframe["Requirement"]))
 
     def test_keyword_search_matches_course_feature_tags(self) -> None:
         dataframe = pd.DataFrame(
@@ -535,6 +585,49 @@ class DashboardHelperTests(unittest.TestCase):
 
         self.assertEqual(mask.tolist(), [True])
 
+    def test_course_export_dataframe_uses_english_headers_without_translating_source_values(self) -> None:
+        dataframe = pd.DataFrame(
+            [
+                {
+                    "course_name": "Master of Data Science",
+                    "feature_tags_display": "data science",
+                    "cricos": "123456A",
+                    "admission_source_label": "Official admissions",
+                    "duration_display": "2 years",
+                    "duration_min_years": 2,
+                    "duration_max_years": 2,
+                    "intakes": "FEB, JUL",
+                    "tuition_fee_aud": 56000,
+                    "application_flags_display": "Portfolio",
+                    "required_documents_display": "",
+                    "language_tests_display": "IELTS Academic",
+                    "ielts_overall": 7.0,
+                    "ielts_min_band": 6.5,
+                    "ielts_listening": 6.5,
+                    "ielts_reading": 6.5,
+                    "ielts_speaking": 6.5,
+                    "ielts_writing": 6.5,
+                    "academic_summary": "Relevant bachelor degree.",
+                    "source_url_display": "https://www.sydney.edu.au/courses/test.html",
+                    "source_file_name": "source.xlsx",
+                    "source_sheet_name": "Sheet1",
+                    "source_row_number": 2,
+                }
+            ]
+        )
+
+        export_df = build_course_export_dataframe(dataframe, language="en")
+
+        self.assertIn("Course name", export_df.columns)
+        self.assertIn("Feature tags", export_df.columns)
+        self.assertEqual(export_df.loc[0, "Course name"], "Master of Data Science")
+        self.assertEqual(export_df.loc[0, "CRICOS"], "123456A")
+
+    def test_localized_document_path_uses_chinese_pair_and_falls_back_to_english(self) -> None:
+        self.assertEqual(localized_document_path("README.md", "zh"), "README.zh.md")
+        self.assertEqual(localized_document_path("docs/agents/domain.md", "zh"), "docs/agents/domain.md")
+        self.assertEqual(localized_document_path("README.md", "en"), "README.md")
+
     def test_highlight_query_terms_escapes_text_and_marks_matches(self) -> None:
         highlighted = _highlight_query_terms("Portfolio <required> for design portfolio.", "portfolio")
 
@@ -553,18 +646,35 @@ class DashboardHelperTests(unittest.TestCase):
             metadata={"field": "application_details_json"},
         )
 
-        source_bits = _format_semantic_result_source_bits(result)
+        source_bits = _format_semantic_result_source_bits(result, language="zh")
 
         self.assertEqual(
             source_bits,
             ["application_details_json", "[官网来源](https://www.sydney.edu.au/courses/test.html)"],
         )
 
+    def test_admission_semantic_search_renders_english_copy_by_default(self) -> None:
+        with patch("src.dashboard.st") as streamlit:
+            streamlit.session_state = {}
+            streamlit.form.return_value = MagicMock()
+            streamlit.columns.side_effect = lambda spec: [MagicMock() for _ in range(spec if isinstance(spec, int) else len(spec))]
+            streamlit.form_submit_button.return_value = False
+
+            render_admission_search()
+
+        streamlit.text_input.assert_called_once_with(
+            "Admissions semantic search",
+            placeholder="portfolio / personal statement / IELTS 7.0 / work experience",
+        )
+        streamlit.number_input.assert_called_once_with("Result count", min_value=3, max_value=20, value=5, step=1)
+        streamlit.form_submit_button.assert_called_once_with("Search", type="primary", use_container_width=True)
+
     def test_semantic_search_empty_results_are_normal_no_results_state(self) -> None:
         with (
             patch("src.dashboard.run_admission_semantic_search", return_value=[]),
             patch("src.dashboard.st") as streamlit,
         ):
+            streamlit.session_state = {"ui_language": "zh"}
             streamlit.text_input.return_value = "portfolio"
             streamlit.number_input.return_value = 5
             streamlit.form_submit_button.return_value = True
@@ -607,36 +717,53 @@ class DashboardHelperTests(unittest.TestCase):
         self.assertTrue(dataframe.attrs["feature_profile_storage_available"])
 
     def test_feature_profile_storage_warning_explains_degraded_mode(self) -> None:
-        message = _feature_profile_storage_warning()
+        message = _feature_profile_storage_warning("zh")
 
         self.assertIn("课程画像", message)
         self.assertIn("migration", message)
 
+    def test_feature_profile_storage_warning_uses_english_by_default(self) -> None:
+        message = _feature_profile_storage_warning()
+
+        self.assertIn("Course Feature Profile", message)
+        self.assertIn("migration", message)
+
     def test_recommendation_error_message_identifies_missing_feature_profile_migration(self) -> None:
         message = _format_recommendation_error(
-            _recommendation_error_from(RuntimeError("column c.course_features does not exist"))
+            _recommendation_error_from(RuntimeError("column c.course_features does not exist")),
+            language="zh",
         )
 
         self.assertIn("课程画像", message)
         self.assertIn("migration", message)
         self.assertNotEqual(message, "推荐失败：Recommendation request failed.")
 
+    def test_recommendation_error_message_uses_english_by_default(self) -> None:
+        message = _format_recommendation_error(
+            _recommendation_error_from(RuntimeError("column c.course_features does not exist"))
+        )
+
+        self.assertIn("Course Feature Profile", message)
+        self.assertIn("migration", message)
+
     def test_recommendation_error_message_identifies_database_connection_failure(self) -> None:
         message = _format_recommendation_error(
-            _recommendation_error_from(RuntimeError("connection to server at 127.0.0.1 failed"))
+            _recommendation_error_from(RuntimeError("connection to server at 127.0.0.1 failed")),
+            language="zh",
         )
 
         self.assertIn("数据库连接失败", message)
 
     def test_recommendation_error_message_identifies_vector_configuration_failure(self) -> None:
         message = _format_recommendation_error(
-            _recommendation_error_from(RuntimeError("Vector retrieval requires an embedding client."))
+            _recommendation_error_from(RuntimeError("Vector retrieval requires an embedding client.")),
+            language="zh",
         )
 
         self.assertIn("向量检索", message)
 
     def test_recommendation_error_message_keeps_unexpected_errors_safe(self) -> None:
-        message = _format_recommendation_error(_recommendation_error_from(ValueError("unexpected bad input")))
+        message = _format_recommendation_error(_recommendation_error_from(ValueError("unexpected bad input")), language="zh")
 
         self.assertIn("推荐失败", message)
         self.assertIn("unexpected bad input", message)

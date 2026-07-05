@@ -19,6 +19,23 @@ Expected result:
 - Missing feature-profile storage tests pass.
 - Existing migrated-profile tests still pass.
 
+Run the headed Playwright bilingual dashboard smoke test when validating the
+local UI:
+
+```bash
+cd /Users/admin/Documents/liuxue_agent\ real/usyd_pg_import
+RUN_DASHBOARD_E2E=1 .venv/bin/python -m unittest tests.test_dashboard_bilingual_e2e -v
+```
+
+Expected result:
+
+- A visible Chromium window opens.
+- English is the default dashboard UI.
+- Switching to Chinese updates dashboard-authored labels.
+- The language remains active while moving between recommendation and course
+  search workspaces.
+- Documentation links point to the active language pair when available.
+
 ## Unmigrated Database Smoke Check
 
 Use this state when the local `courses` table does not yet have
