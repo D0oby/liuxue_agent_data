@@ -65,3 +65,67 @@ become active user-facing guidance.
 
 Official source data and generated evidence are not treated as documentation
 that must be translated.
+
+### E2E Regression Suite
+
+The E2E Regression Suite protects the full USYD data-to-dashboard workflow, not
+only the visible dashboard UI. Its scope includes Excel import, database
+migrations, official admissions crawl behavior, admissions chunking and vector
+storage, recommendation retrieval and scoring, Course Feature Profile behavior,
+and the Streamlit dashboard user flows.
+
+The suite verifies the integrated workflow as an operator/user would experience
+it. It is broader than a Dashboard smoke test and broader than isolated unit or
+module integration tests.
+
+The default E2E Regression Suite is hermetic: it uses local fixtures, a local
+test database, deterministic embedding behavior, temporary vector storage, and
+Playwright against a local Streamlit dashboard. It should be repeatable without
+external network access.
+
+The hermetic E2E Regression Suite must use an isolated database. It must not
+reuse the developer or production `DATABASE_URL`. The suite should read an
+explicit E2E database configuration, run migrations and fixture ingestion there,
+and clean up its own state without writing to normal project data.
+
+The default hermetic fixture set should be small and representative rather than
+a full production Excel import. It should cover a few courses across distinct
+domains, admissions outcomes, application-detail cases, intakes, fees, and
+durations so regressions are easy to understand and the suite remains fast.
+
+The default browser mode for the E2E Regression Suite is headless. Headed
+browser execution is only a local debugging option and is not the default
+regression gate.
+
+The E2E Regression Suite should have a single operator-facing command. That
+entry point orchestrates migrations, fixture import, admissions enrichment,
+chunk/vector preparation, Course Feature Profile generation, recommendation
+checks, and Streamlit/Playwright dashboard checks in order.
+
+In the hermetic E2E Regression Suite, admissions crawl coverage means fixture
+admissions content is parsed and stored through the project ingestion path so
+later recommendation and dashboard checks consume realistic admissions data. It
+does not mean the default suite visits the live USYD website.
+
+In the hermetic E2E Regression Suite, embedding behavior should be deterministic
+and local. The suite should still exercise real admissions chunking, vector
+storage, ChromaDB search, hybrid retrieval, and vector-unavailable fallback
+behavior without calling external embedding APIs by default.
+
+The primary E2E Regression Suite entry points are the Python recommendation
+service path and the Streamlit dashboard path. FastAPI endpoint coverage is a
+thin schema smoke layer, not the central orchestration path for the full suite.
+
+The E2E Regression Suite should produce failure artifacts under an E2E artifacts
+directory. Useful artifacts include Playwright screenshots, optional traces or
+videos, server logs, and a run summary with failed stage, course identifiers,
+queries, and diagnostic messages. Temporary vector storage and database state
+are cleaned by default unless an explicit keep-artifacts option is enabled.
+
+The hermetic E2E Regression Suite is suitable for optional, nightly, or manual
+CI workflows and local operator validation. It is not the default lightweight
+test gate for every small change. Live external smoke checks are manual only.
+
+Live external smoke checks are separate and manual. They may call the real USYD
+website or external embedding APIs, must require an explicit opt-in flag, and
+are not part of the default regression gate.

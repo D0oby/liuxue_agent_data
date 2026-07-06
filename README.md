@@ -82,6 +82,9 @@ tags, service response schemas, logs, or diagnostic details.
 - Course Feature Profile rollout smoke checks:
   [English](docs/runbooks/course-feature-profile-rollout-smoke-checks.md) |
   [中文](docs/runbooks/course-feature-profile-rollout-smoke-checks.zh.md)
+- Hermetic E2E regression suite:
+  [English](docs/runbooks/e2e-regression-suite.md) |
+  [中文](docs/runbooks/e2e-regression-suite.zh.md)
 - Recommendation runtime compatibility PRD:
   [docs/prds/recommendation-runtime-compatibility-and-search-diagnostics.md](docs/prds/recommendation-runtime-compatibility-and-search-diagnostics.md)
 

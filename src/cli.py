@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from src.config import load_settings
@@ -141,6 +142,41 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     audit_parser.add_argument("--limit", type=int, help="Maximum number of courses to inspect")
     audit_parser.set_defaults(command="audit-course-features")
+
+    e2e_parser = subparsers.add_parser(
+        "e2e-regression",
+        help="Run the hermetic USYD data-to-dashboard E2E regression suite",
+    )
+    e2e_parser.add_argument(
+        "--database-url",
+        help="Explicit isolated E2E PostgreSQL URL. Defaults to E2E_DATABASE_URL; never falls back to DATABASE_URL.",
+    )
+    e2e_parser.add_argument(
+        "--artifacts-dir",
+        default="var/e2e_artifacts",
+        help="Directory for E2E run summaries, logs, screenshots, and debug artifacts.",
+    )
+    e2e_parser.add_argument(
+        "--keep-artifacts",
+        action="store_true",
+        help="Keep temporary fixture/vector state for debugging instead of cleaning it after the run.",
+    )
+    e2e_parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Run Playwright in headed mode for local debugging. The default is headless.",
+    )
+    e2e_parser.add_argument(
+        "--skip-dashboard",
+        action="store_true",
+        help="Skip the Streamlit/Playwright stage when browser dependencies are unavailable.",
+    )
+    e2e_parser.add_argument(
+        "--skip-api-smoke",
+        action="store_true",
+        help="Skip the thin FastAPI schema smoke stage.",
+    )
+    e2e_parser.set_defaults(command="e2e-regression")
     return parser
 
 
@@ -305,6 +341,27 @@ def main() -> None:
             return
         for finding in findings:
             print(f"{finding.course_id}\t{finding.code}\t{finding.course_name}\t{finding.message}")
+        return
+
+    if args.command == "e2e-regression":
+        from src.e2e_regression import E2ERunOptions, run_e2e_regression
+
+        result = run_e2e_regression(
+            E2ERunOptions(
+                database_url=args.database_url or os.getenv("E2E_DATABASE_URL"),
+                normal_database_url=os.getenv("DATABASE_URL"),
+                artifacts_dir=Path(args.artifacts_dir),
+                keep_artifacts=args.keep_artifacts,
+                headed=args.headed,
+                skip_dashboard=args.skip_dashboard,
+                run_api_smoke=not args.skip_api_smoke,
+            )
+        )
+        for stage in result.stages:
+            print(f"{stage.status.upper()}\t{stage.name}")
+        print(f"E2E summary: {result.run_artifacts_dir / 'summary.json'}")
+        if not result.success:
+            raise SystemExit(1)
         return
 
     raise ValueError(f"Unsupported command: {args.command}")
