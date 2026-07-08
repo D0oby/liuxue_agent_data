@@ -2,6 +2,93 @@
 
 ## Glossary
 
+### Study Abroad RAG
+
+**Study Abroad Knowledge RAG**:
+A retrieval layer for study-abroad knowledge sources beyond the USYD course
+recommendation dataset, including official sources, study-abroad posts, and
+anonymous internal datasets. It returns traceable evidence snippets rather than
+final admissions decisions.
+_Avoid_: AdmissionsRAGService, USYD recommendation RAG, search system
+
+**USYD Recommendation Layer**:
+The read-only decision layer that recommends USYD programs from the existing
+course, admissions, intake, and vectorized admissions datasets. It is separate
+from the broader Study Abroad Knowledge RAG.
+_Avoid_: Study Abroad Knowledge RAG, general RAG
+
+**Evidence Snippet**:
+A retrieved passage with enough source metadata for a user or agent to inspect
+where the fact came from. Evidence Snippets are not generated answers and should
+not contain unsupported model knowledge.
+_Avoid_: answer, summary, generated fact
+
+**Study Abroad Source**:
+A single traceable knowledge source that can be indexed by Study Abroad
+Knowledge RAG, such as an official policy page, university page, study-abroad
+post, or anonymous internal dataset extract.
+_Avoid_: raw table, blob, document
+
+**Source Manifest**:
+The declared inventory of Study Abroad Sources eligible for indexing. Each
+entry identifies the source, its type, locator, freshness metadata, trust
+metadata, and filtering metadata before content becomes searchable.
+_Avoid_: database scan, implicit source list
+
+**Source Locator**:
+The stable reference that lets a user or operator return from an Evidence
+Snippet to the original Study Abroad Source location, such as a URL, file path,
+page, row, heading, or anchor.
+_Avoid_: source, title, label
+
+**Trust Tier**:
+The source credibility category used by Study Abroad Knowledge RAG to explain
+and rank evidence. Official institutions and government sources are higher
+trust than marketing material, posts, or anonymous internal extracts.
+_Avoid_: score, confidence, authority
+
+**Anonymous Internal Source**:
+A Study Abroad Source derived from internal data after identity-protecting
+preparation. It may inform retrieval, but its raw content is not assumed to be
+safe to show as quoted evidence.
+_Avoid_: public source, anonymized public evidence
+
+**Privacy Level**:
+The source disclosure category that determines whether a Study Abroad Search
+Result may include raw text, redacted text, summary-only evidence, or no
+displayable content.
+_Avoid_: trust tier, source type, anonymity
+
+**Ranking Policy**:
+The study-abroad retrieval policy that expresses which evidence should be
+trusted, boosted, penalized, filtered, or disclosed for a given user question.
+It explains why a Study Abroad Search Result is ranked where it is.
+_Avoid_: fusion, raw score, embedding score
+
+**Query Intent**:
+The user question category that changes which Study Abroad Sources are most
+appropriate as evidence, such as requirements, deadlines, fees, policy,
+applicant fit, program recommendation, or student experience.
+_Avoid_: keyword, query string, route
+
+**Internal Case Evidence**:
+Evidence derived from prior applicant cases or internal study-abroad records.
+It may support fit, background similarity, or chance-estimation context, but it
+does not override official requirements or policy evidence.
+_Avoid_: official requirement, admission rule, policy fact
+
+**Study Abroad Search Result**:
+The structured output of Study Abroad Knowledge RAG search, consisting of an
+Evidence Snippet, source metadata, ranking score, and ranking reasons. It is an
+input to answer generation, not the generated answer itself.
+_Avoid_: recommendation, final answer, advice
+
+**Answer Generation Layer**:
+The caller-owned layer that turns Study Abroad Search Results into a user-facing
+answer or plan. It must preserve source attribution and handle conflicts rather
+than treating retrieval as a final conclusion.
+_Avoid_: Study Abroad Knowledge RAG, index, retriever
+
 ### UI Language
 
 The language used by the dashboard shell and product-authored interface copy.
