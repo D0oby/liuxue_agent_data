@@ -148,6 +148,7 @@ class PlanAssembler:
             score=round(candidate.final_score, 4),
             band=candidate.match_band,
             recommendation_reason=self._build_recommendation_reason(user_profile, candidate, evidence, source_url),
+            feature_match=candidate.feature_match,
             evidence_snippets=evidence,
             source_url=source_url,
         )
@@ -183,11 +184,15 @@ class PlanAssembler:
     ) -> str:
         evidence_text = evidence[0].text if evidence else candidate.requirement_summary
         source_text = source_url or "source URL unavailable"
+        feature_text = ""
+        if candidate.feature_match is not None:
+            feature_text = f" Feature profile match: {candidate.feature_match.score:g}/100."
         return (
             f"GPA: user {user_profile.gpa_user:g} using {self._format_gpa_method(candidate.gpa_calculation_method)} "
             f"vs required {candidate.gpa_min:g}. "
             f"IELTS: user {user_profile.ielts_overall_user:g}/{user_profile.ielts_min_band_user:g} "
             f"vs required {candidate.ielts_overall_min:g}/{candidate.ielts_min_band_min:g}. "
+            f"{feature_text} "
             f"Relevance: {candidate.retrieval_reason}. "
             f"Evidence: {evidence_text}. Source: {source_text}."
         )

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from src.models.course_features import CourseFeatureProfile
 from src.models.recommendation import RawAdmissionRequirement
 
 
@@ -27,6 +28,7 @@ class CourseSearchRow:
     academic_requirements_json: dict[str, Any] | None = None
     application_details_json: dict[str, Any] | None = None
     supplementary_metadata_json: dict[str, Any] | None = None
+    course_features: CourseFeatureProfile | dict[str, Any] | None = None
 
 
 class RecommendationRepository:
@@ -57,48 +59,53 @@ class RecommendationRepository:
             params.extend([pattern, pattern, pattern, pattern, pattern])
         params.append(limit)
 
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                select
-                    c.id::text,
-                    c.course_name,
-                    c.course_name_raw,
-                    c.cricos,
-                    c.duration_min_years::float,
-                    c.duration_max_years::float,
-                    c.tuition_fee_aud::float,
-                    coalesce(car.academic_requirement_text, ''),
-                    coalesce(car.raw_english_requirement, ''),
-                    car.ielts_overall::float,
-                    car.ielts_min_band::float,
-                    car.source_url,
-                    car.ielts_listening::float,
-                    car.ielts_reading::float,
-                    car.ielts_speaking::float,
-                    car.ielts_writing::float,
-                    car.academic_requirements_json,
-                    car.application_details_json,
-                    car.supplementary_metadata_json
-                from courses c
-                left join course_admission_requirements car
-                  on car.course_id = c.id
-                 and car.is_current = true
-                where {" or ".join(clauses)}
-                order by c.course_name, c.source_row_number
-                limit %s
-                """,
-                params,
-            )
-            return [self._map_course_search_row(row) for row in cur.fetchall()]
+        sql = self._build_course_search_sql(
+            where_clause="where " + " or ".join(clauses),
+            order_and_limit="order by c.course_name, c.source_row_number\n                limit %s",
+            include_feature_columns=True,
+        )
+        fallback_sql = self._build_course_search_sql(
+            where_clause="where " + " or ".join(clauses),
+            order_and_limit="order by c.course_name, c.source_row_number\n                limit %s",
+            include_feature_columns=False,
+        )
+        rows = self._fetch_course_search_rows(conn, sql=sql, fallback_sql=fallback_sql, params=params)
+        return [self._map_course_search_row(row) for row in rows]
 
     def fetch_courses_by_ids(self, conn, *, course_ids: list[str]) -> dict[str, CourseSearchRow]:
         if not course_ids:
             return {}
         placeholders = ", ".join(["%s"] * len(course_ids))
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
+        sql = self._build_course_search_sql(
+            where_clause=f"where c.id in ({placeholders})",
+            order_and_limit="",
+            include_feature_columns=True,
+        )
+        fallback_sql = self._build_course_search_sql(
+            where_clause=f"where c.id in ({placeholders})",
+            order_and_limit="",
+            include_feature_columns=False,
+        )
+        rows = [
+            self._map_course_search_row(row)
+            for row in self._fetch_course_search_rows(
+                conn,
+                sql=sql,
+                fallback_sql=fallback_sql,
+                params=course_ids,
+            )
+        ]
+        return {row.course_id: row for row in rows}
+
+    def _build_course_search_sql(
+        self,
+        *,
+        where_clause: str,
+        order_and_limit: str,
+        include_feature_columns: bool,
+    ) -> str:
+        feature_column = "c.course_features" if include_feature_columns else "null::jsonb as course_features"
+        return f"""
                 select
                     c.id::text,
                     c.course_name,
@@ -118,17 +125,36 @@ class RecommendationRepository:
                     car.ielts_writing::float,
                     car.academic_requirements_json,
                     car.application_details_json,
-                    car.supplementary_metadata_json
+                    car.supplementary_metadata_json,
+                    {feature_column}
                 from courses c
                 left join course_admission_requirements car
                   on car.course_id = c.id
                  and car.is_current = true
-                where c.id in ({placeholders})
-                """,
-                course_ids,
-            )
-            rows = [self._map_course_search_row(row) for row in cur.fetchall()]
-        return {row.course_id: row for row in rows}
+                {where_clause}
+                {order_and_limit}
+                """
+
+    def _fetch_course_search_rows(
+        self,
+        conn,
+        *,
+        sql: str,
+        fallback_sql: str,
+        params: list[object],
+    ) -> list[tuple[Any, ...]]:
+        try:
+            return self._execute_course_search(conn, sql=sql, params=params)
+        except Exception as exc:
+            if not _is_missing_feature_column_error(exc):
+                raise
+            _rollback_failed_select(conn)
+            return self._execute_course_search(conn, sql=fallback_sql, params=params)
+
+    def _execute_course_search(self, conn, *, sql: str, params: list[object]) -> list[tuple[Any, ...]]:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
 
     def fetch_intakes_by_course_ids(self, conn, *, course_ids: list[str]) -> dict[str, list[str]]:
         if not course_ids:
@@ -226,8 +252,25 @@ class RecommendationRepository:
             academic_requirements_json=_as_dict(row[16]),
             application_details_json=_as_dict(row[17]),
             supplementary_metadata_json=_as_dict(row[18]),
+            course_features=_as_dict(row[19]) or None,
         )
 
 
 def _as_dict(value: object) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _is_missing_feature_column_error(exc: Exception) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        message = str(current).lower()
+        if "course_feature" in message and "does not exist" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _rollback_failed_select(conn) -> None:
+    rollback = getattr(conn, "rollback", None)
+    if callable(rollback):
+        rollback()

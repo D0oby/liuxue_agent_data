@@ -37,12 +37,24 @@ class RulesConfig:
 
 
 @dataclass(frozen=True)
+class FeatureMatchingConfig:
+    tag_weight: float = 0.4
+    numeric_weight: float = 0.6
+    gpa_penalty: float = 12.0
+    ielts_penalty: float = 10.0
+    budget_penalty: float = 8.0
+    duration_penalty: float = 5.0
+    background_penalty: float = 10.0
+
+
+@dataclass(frozen=True)
 class RecommendationConfig:
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
     band: BandConfig = field(default_factory=BandConfig)
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     rules: RulesConfig = field(default_factory=RulesConfig)
+    feature_matching: FeatureMatchingConfig = field(default_factory=FeatureMatchingConfig)
 
 
 @dataclass(frozen=True)
@@ -127,6 +139,15 @@ def load_recommendation_config() -> RecommendationConfig:
         rules=RulesConfig(
             enable_ielts_band_gate=_read_bool_env("RECOMMENDATION_RULES_ENABLE_IELTS_BAND_GATE", True),
         ),
+        feature_matching=FeatureMatchingConfig(
+            tag_weight=_read_non_negative_float_env("FEATURE_MATCHING_TAG_WEIGHT", 0.4),
+            numeric_weight=_read_non_negative_float_env("FEATURE_MATCHING_NUMERIC_WEIGHT", 0.6),
+            gpa_penalty=_read_non_negative_float_env("FEATURE_MATCHING_GPA_PENALTY", 12.0),
+            ielts_penalty=_read_non_negative_float_env("FEATURE_MATCHING_IELTS_PENALTY", 10.0),
+            budget_penalty=_read_non_negative_float_env("FEATURE_MATCHING_BUDGET_PENALTY", 8.0),
+            duration_penalty=_read_non_negative_float_env("FEATURE_MATCHING_DURATION_PENALTY", 5.0),
+            background_penalty=_read_non_negative_float_env("FEATURE_MATCHING_BACKGROUND_PENALTY", 10.0),
+        ),
     )
 
 
@@ -162,6 +183,19 @@ def _read_float_env(name: str, default: float) -> float:
         raise ValueError(f"{name} must be a number.") from exc
     if value <= 0:
         raise ValueError(f"{name} must be greater than zero.")
+    return value
+
+
+def _read_non_negative_float_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number.") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be greater than or equal to zero.")
     return value
 
 
